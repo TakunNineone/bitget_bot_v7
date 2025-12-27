@@ -1,0 +1,6 @@
+Что изменено (правильный патч без миграций БД):
+- features.py: добавлены поля trade_count_sum_5s, active_seconds_5s, delta_rate_z; z-score считается только по активным секундам (trade_count>0).
+- strategy_skeleton.py: гейт по потоку (trades5s>=5 и active5s>=3), cooldown 5 минут, ATR min поднят до 0.40%, dz порог усиливается пока mark_dev_z не готов.
+Как применить:
+1) Замени файлы в проекте на эти версии.
+2) Перезапусти сборщик и strategy_skeleton.

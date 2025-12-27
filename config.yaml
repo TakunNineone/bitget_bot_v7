@@ -1,0 +1,40 @@
+# Основные настройки
+inst_type: "USDT-FUTURES"         # WS instType
+rest_product_type: "usdt-futures" # REST productType (lowercase)
+symbols:
+  - "SOLUSDT"
+
+# WebSocket
+ws_public_url: "wss://ws.bitget.com/v2/ws/public"
+ping_interval_sec: 30
+reconnect_backoff_sec: 3
+
+# Шардирование подписок:
+# max_channels_per_connection: максимум подписок каналов на одно соединение
+# (у тебя 5 каналов/символ: ticker,trade,books15,candle1m,candle15m)
+max_channels_per_connection: 800
+max_msgs_per_second: 8
+
+# Каналы
+channels_per_symbol:
+  - "ticker"
+  - "trade"
+  - "books15"
+  - "candle1m"
+  - "candle15m"
+
+# REST polling интервалы
+rest_poll:
+  symbol_price_sec: 10
+  open_interest_sec: 20
+  current_fund_rate_sec: 120
+  funding_time_sec: 600
+
+# Хранилище
+data_dir: "data"
+sqlite_path: "data/bitget.db"
+
+# Агрегации
+aggregations:
+  agg_1s_enabled: true
+  agg_1m_enabled: true
