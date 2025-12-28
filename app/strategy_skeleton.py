@@ -4,89 +4,35 @@ import argparse
 import sqlite3
 import time
 from dataclasses import dataclass
-from typing import Optional, Dict, List
+from typing import Dict, List, Optional
 
 from .features import FeatureService, FeatureRow
+from datetime import datetime, timezone, timedelta
 
+MSK = timezone(timedelta(hours=3))
+
+# =========================
+# Signal
+# =========================
 
 @dataclass
 class Signal:
     instId: str
     ts: int
-    side: str  # "long" | "short" | "flat"
+    side: str  # long / short / flat
     reason: str
-    stop_loss: Optional[float] = None          # fraction, e.g. 0.0035
-    take_profit: Optional[float] = None        # fraction, e.g. 0.0100
-    trailing_start: Optional[float] = None     # fraction
-    trailing_step: Optional[float] = None      # fraction
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
+    trailing_start: Optional[float] = None
+    trailing_step: Optional[float] = None
 
 
-@dataclass
-class VirtualPosition:
-    instId: str
-    side: str                 # "long" or "short"
-    entry_price: float
-    entry_ts: int
-    stop_loss: float          # fraction
-    take_profit: float        # fraction
-    trailing_start: float     # fraction
-    trailing_step: float      # fraction
+# =========================
+# Decision logic
+# =========================
 
-    best_pnl: float = 0.0
-    worst_pnl: float = 0.0
-    trail_active: bool = False
-    trail_level: Optional[float] = None  # price level
-
-
-def _clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
-
-
-def _pnl_frac(pos: VirtualPosition, price: float) -> float:
-    """Unrealized PnL as fraction (e.g. 0.01 = +1%)."""
-    if pos.side == "long":
-        return price / pos.entry_price - 1.0
-    return pos.entry_price / price - 1.0
-
-
-def _should_exit_and_update_trail(pos: VirtualPosition, price: float) -> Optional[str]:
-    """Updates trailing state and returns exit reason: SL/TP/TRAIL or None."""
-    p = _pnl_frac(pos, price)
-
-    # Hard SL / TP
-    if p <= -pos.stop_loss:
-        return "SL"
-    if p >= pos.take_profit:
-        return "TP"
-
-    # Activate trailing
-    if (not pos.trail_active) and p >= pos.trailing_start:
-        pos.trail_active = True
-        if pos.side == "long":
-            pos.trail_level = price * (1.0 - pos.trailing_step)
-        else:
-            pos.trail_level = price * (1.0 + pos.trailing_step)
-
-    # Update trailing & check trigger
-    if pos.trail_active and pos.trail_level is not None:
-        if pos.side == "long":
-            new_level = price * (1.0 - pos.trailing_step)
-            if new_level > pos.trail_level:
-                pos.trail_level = new_level
-            if price <= pos.trail_level:
-                return "TRAIL"
-        else:
-            new_level = price * (1.0 + pos.trailing_step)
-            if new_level < pos.trail_level:
-                pos.trail_level = new_level
-            if price >= pos.trail_level:
-                return "TRAIL"
-
-    return None
-
-
-def decide(f: FeatureRow) -> Signal:
-    # ---- HARD GATES ----
+def decide(f: FeatureRow, vol_gate: float = 0.0015) -> Signal:
+    # ---- SPREAD ----
     if f.spread_bps is None or f.spread_bps > 8.0:
         return Signal(f.instId, f.ts, "flat", "spread")
 
@@ -99,12 +45,29 @@ def decide(f: FeatureRow) -> Signal:
 
     atr_pct = f.atr15m / px
 
-    # your current tuned gate
-    if atr_pct < 0.0018:
-        return Signal(f.instId, f.ts, "flat", "low_vol")
+    # ---- FAST REACT ----
+    fast_vol = (
+        (f.range_60s_pct is not None and f.range_60s_pct >= 0.0012) or
+        (f.ret_std_60s is not None and f.ret_std_60s >= 0.00045)
+    )
+    fast_flow = f.flow_spike is not None and f.flow_spike >= 1.6
 
-    # ---- FLOW GATE ----
-    if f.trade_count_sum_5s < 5 or f.active_seconds_5s < 3:
+    # print('atr_pct:',atr_pct,'vol_gate:',vol_gate)
+    if atr_pct < vol_gate:
+        if not (fast_vol and fast_flow):
+            return Signal(f.instId, f.ts, "flat", "low_vol")
+
+    # ---- FLOW GATE (ROBUST) ----
+    flow60 = f.flow_60s or 0
+    spike = float(f.flow_spike or 0.0)
+
+    # базовая ликвидность ~2 трейда/сек
+    # print('flow60:',flow60,'spike:',spike)
+    if flow60 < 120 and spike < 1.6:
+        return Signal(f.instId, f.ts, "flat", "no_flow")
+
+    # ускорение в последние секунды
+    if f.trade_count_sum_5s < 2 and spike < 1.6:
         return Signal(f.instId, f.ts, "flat", "no_flow")
 
     # ---- TRIGGER ----
@@ -122,40 +85,34 @@ def decide(f: FeatureRow) -> Signal:
 
     side = "long" if long_ok else "short"
 
-    sl = _clamp(0.9 * atr_pct, 0.0035, 0.0120)
-    tp = _clamp(2.0 * sl, 0.0100, 0.0200)
-    trailing_start = _clamp(0.8 * tp, 0.0060, 0.0150)
-    trailing_step = _clamp(0.35 * sl, 0.0015, 0.0040)
+    sl = max(0.0035, min(0.0120, 0.9 * atr_pct))
+    tp = max(0.0100, min(0.0200, 2.0 * sl))
+    tr_start = max(0.0060, min(0.0150, 0.8 * tp))
+    tr_step = max(0.0015, min(0.0040, 0.35 * sl))
 
     reason = (
         f"dz={dz:.2f} imb={imb:.3f} atr={atr_pct:.4f} "
-        f"flow5s={f.trade_count_sum_5s}/{f.active_seconds_5s}"
+        f"flow5s={f.trade_count_sum_5s}/{f.active_seconds_5s} "
+        f"flow60={flow60} spike={spike:.2f} "
+        f"fastR={f.range_60s_pct or 0:.4f} fastStd={f.ret_std_60s or 0:.6f}"
     )
 
     return Signal(
         f.instId, f.ts, side, reason,
         stop_loss=sl,
         take_profit=tp,
-        trailing_start=trailing_start,
-        trailing_step=trailing_step
+        trailing_start=tr_start,
+        trailing_step=tr_step,
     )
 
 
-def latest_sec_ts(conn: sqlite3.Connection, instId: str) -> Optional[int]:
-    cur = conn.execute("SELECT MAX(sec_ts) FROM agg_1s_micro WHERE instId=?", (instId,))
-    r = cur.fetchone()
-    return int(r[0]) if r and r[0] is not None else None
+# =========================
+# Runner
+# =========================
 
-
-def run(sqlite_path: str, instIds: List[str], every_sec: int = 2) -> None:
-    fs = FeatureService(sqlite_path)
-    conn = sqlite3.connect(sqlite_path)
-
-    cooldown_ms = 5 * 60 * 1000
-    last_signal_ts: Dict[str, int] = {}
-
-    positions: Dict[str, VirtualPosition] = {}
-    last_pnl_print: Dict[str, float] = {}
+def run(db_path: str, symbols: List[str], every: int):
+    fs = FeatureService(db_path)
+    conn = sqlite3.connect(db_path)
 
     stats = {
         "spread": 0,
@@ -170,99 +127,103 @@ def run(sqlite_path: str, instIds: List[str], every_sec: int = 2) -> None:
         "exits": 0,
     }
 
+    last_signal_ts: Dict[str, int] = {}
     last_report = time.time()
 
-    try:
-        while True:
-            for instId in instIds:
-                sec_ts = latest_sec_ts(conn, instId)
-                if sec_ts is None:
+    # debug snapshots
+    last_flow_debug: Dict[str, dict] = {}
+
+    instIds = symbols
+
+    while True:
+        for instId in instIds:
+            row = conn.execute(
+                "SELECT MAX(sec_ts) FROM agg_1s_micro WHERE instId=?",
+                (instId,),
+            ).fetchone()
+
+            if not row or not row[0]:
+                continue
+
+            sec_ts = int(row[0])
+
+            f = fs.compute_features(instId, sec_ts)
+            if not f:
+                continue
+
+            # store snapshot for debug
+            last_flow_debug[instId] = {
+                "flow60": f.flow_60s,
+                "spike": f.flow_spike,
+                "tc5": f.trade_count_sum_5s,
+                "act5": f.active_seconds_5s,
+                "range60": f.range_60s_pct,
+                "retstd60": f.ret_std_60s,
+            }
+
+            sig = decide(f)
+
+            if sig.side == "flat":
+                stats[sig.reason] = stats.get(sig.reason, 0) + 1
+                continue
+
+            # cooldown 5 minutes
+            if instId in last_signal_ts and sec_ts - last_signal_ts[instId] < 5 * 60 * 1000:
+                stats["cooldown"] += 1
+                continue
+
+            last_signal_ts[instId] = sec_ts
+            stats["signals"] += 1
+            stats["entries"] += 1
+
+            print(
+                f"[{time.strftime('%H:%M:%S')}] {instId.upper()} {sig.side.upper()} "
+                f"SL={sig.stop_loss:.4f} TP={sig.take_profit:.4f} "
+                f"TR={sig.trailing_start:.4f}/{sig.trailing_step:.4f} :: {sig.reason}"
+            )
+
+        # periodic report
+        if time.time() - last_report >= 30:
+            print("\n[STATS 30s] " + " | ".join(f"{k}:{v}" for k, v in stats.items()))
+
+            def fmt(x, nd=2):
+                if x is None:
+                    return "NA"
+                try:
+                    return f"{float(x):.{nd}f}"
+                except Exception:
+                    return str(x)
+
+            for sid in instIds:
+                snap = last_flow_debug.get(sid)
+                if not snap:
                     continue
 
-                f = fs.compute_features(instId, sec_ts)
-                if not f:
-                    continue
-
-                px = f.mid if f.mid is not None else f.vwap
-
-                # ---- PAPER PNL UPDATE (even during cooldown) ----
-                if px is not None and instId in positions:
-                    pos = positions[instId]
-                    p = _pnl_frac(pos, float(px))
-                    pos.best_pnl = max(pos.best_pnl, p)
-                    pos.worst_pnl = min(pos.worst_pnl, p)
-
-                    exit_reason = _should_exit_and_update_trail(pos, float(px))
-
-                    now = time.time()
-                    if (now - last_pnl_print.get(instId, 0.0)) >= 5.0:
-                        trail = f"{pos.trail_level:.4f}" if pos.trail_level is not None else "-"
-                        print(
-                            f"[PNL] {instId} {pos.side.upper()} px={float(px):.4f} "
-                            f"pnl={p*100:.2f}% best={pos.best_pnl*100:.2f}% worst={pos.worst_pnl*100:.2f}% "
-                            f"trail={trail}"
-                        )
-                        last_pnl_print[instId] = now
-
-                    if exit_reason:
-                        print(
-                            f"[EXIT] {instId} {pos.side.upper()} reason={exit_reason} "
-                            f"pnl={p*100:.2f}% best={pos.best_pnl*100:.2f}% worst={pos.worst_pnl*100:.2f}%"
-                        )
-                        del positions[instId]
-                        stats["exits"] += 1
-
-                # One position per symbol in this skeleton
-                if instId in positions:
-                    continue
-
-                # ---- COOLDOWN FOR NEW ENTRIES ----
-                last_ts = last_signal_ts.get(instId)
-                if last_ts is not None and (sec_ts - last_ts) < cooldown_ms:
-                    stats["cooldown"] += 1
-                    continue
-
-                sig = decide(f)
-
-                if sig.side == "flat":
-                    stats[sig.reason] = stats.get(sig.reason, 0) + 1
-                    continue
-
-                last_signal_ts[instId] = sec_ts
-                stats["signals"] += 1
+                flow60 = snap.get("flow60")
+                spike = snap.get("spike")
+                tc5 = snap.get("tc5")
+                act5 = snap.get("act5")
+                r60 = snap.get("range60")
+                s60 = snap.get("retstd60")
 
                 print(
-                    f"[{time.strftime('%H:%M:%S')}] {sig.instId} {sig.side.upper()} "
-                    f"SL={sig.stop_loss:.4f} TP={sig.take_profit:.4f} "
-                    f"TR={sig.trailing_start:.4f}/{sig.trailing_step:.4f} :: {sig.reason}"
+                    f"[FLOW] {sid} "
+                    f"flow60={flow60 if flow60 is not None else 'NA'} "
+                    f"spike={fmt(spike, 2)} "
+                    f"tc5={tc5 if tc5 is not None else 'NA'} act5={act5 if act5 is not None else 'NA'} "
+                    f"range60={fmt(r60, 4)} std60={fmt(s60, 6)}"
                 )
 
-                # ---- OPEN VIRTUAL POSITION ----
-                if px is not None and sig.stop_loss and sig.take_profit and sig.trailing_start and sig.trailing_step:
-                    positions[instId] = VirtualPosition(
-                        instId=instId,
-                        side=sig.side,
-                        entry_price=float(px),
-                        entry_ts=sec_ts,
-                        stop_loss=float(sig.stop_loss),
-                        take_profit=float(sig.take_profit),
-                        trailing_start=float(sig.trailing_start),
-                        trailing_step=float(sig.trailing_step),
-                    )
-                    stats["entries"] += 1
-                    print(f"[ENTRY] {instId} {sig.side.upper()} entry={float(px):.4f}")
+            for k in stats:
+                stats[k] = 0
+            last_report = time.time()
 
-            if time.time() - last_report >= 30:
-                print("\n[STATS 30s] " + " | ".join(f"{k}:{v}" for k, v in stats.items()))
-                stats = {k: 0 for k in stats}
-                last_report = time.time()
+        time.sleep(every)
 
-            time.sleep(every_sec)
 
-    finally:
-        fs.close()
-        conn.close()
-
+# =========================
+# CLI
+# =========================
 
 def cli():
     p = argparse.ArgumentParser()
@@ -270,6 +231,7 @@ def cli():
     p.add_argument("--symbols", nargs="+", required=True)
     p.add_argument("--every", type=int, default=2)
     args = p.parse_args()
+
     run(args.db, args.symbols, args.every)
 
 

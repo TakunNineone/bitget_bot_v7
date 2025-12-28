@@ -19,6 +19,8 @@ TABLES = [
     # aggregates
     "agg_1s_micro",
     "agg_1m_context",
+
+    "backtest_trades"
 ]
 
 def main():
