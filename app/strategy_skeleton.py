@@ -5,11 +5,12 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional
-
-from .features import FeatureService, FeatureRow
 from datetime import datetime, timezone, timedelta
 
+from .features import FeatureService, FeatureRow
+
 MSK = timezone(timedelta(hours=3))
+
 
 # =========================
 # Signal
@@ -21,80 +22,198 @@ class Signal:
     ts: int
     side: str  # long / short / flat
     reason: str
+
     stop_loss: Optional[float] = None
     take_profit: Optional[float] = None
     trailing_start: Optional[float] = None
     trailing_step: Optional[float] = None
 
+    # NEW: Break-even controls (optional; execution/backtest can use them)
+    breakeven_at: Optional[float] = None        # profit fraction when BE triggers (e.g., 0.003 = +0.30%)
+    breakeven_offset: Optional[float] = None    # new SL offset from entry in fraction (e.g., 0.0002 = +0.02%)
+
 
 # =========================
-# Decision logic
+# Decision logic (FLOW-FIRST)
 # =========================
 
 def decide(f: FeatureRow, vol_gate: float = 0.0015) -> Signal:
-    # ---- SPREAD ----
-    if f.spread_bps is None or f.spread_bps > 8.0:
+    if f.spread_bps is None or float(f.spread_bps) > 8.0:
         return Signal(f.instId, f.ts, "flat", "spread")
 
     px = f.mid if f.mid is not None else f.vwap
     if px is None:
         return Signal(f.instId, f.ts, "flat", "no_price")
-
     if f.atr15m is None:
         return Signal(f.instId, f.ts, "flat", "no_atr")
 
-    atr_pct = f.atr15m / px
+    px = float(px)
+    atr_pct = float(f.atr15m) / px
 
-    # ---- FAST REACT ----
-    fast_vol = (
-        (f.range_60s_pct is not None and f.range_60s_pct >= 0.0012) or
-        (f.ret_std_60s is not None and f.ret_std_60s >= 0.00045)
-    )
-    fast_flow = f.flow_spike is not None and f.flow_spike >= 1.6
+    trend_dir = getattr(f, "trend_dir_15m", None)
+    if trend_dir is None or int(trend_dir) == 0:
+        return Signal(f.instId, f.ts, "flat", "no_trend")
+    allowed_side = "long" if int(trend_dir) > 0 else "short"
 
-    # print('atr_pct:',atr_pct,'vol_gate:',vol_gate)
+    ema_diff = getattr(f, "ema_diff_15m", None)
+    ema_slope = getattr(f, "ema_slope_15m", None)
+    if ema_diff is None or ema_slope is None:
+        return Signal(f.instId, f.ts, "flat", "no_trend_strength")
+
+    ema_diff = float(ema_diff)
+    ema_slope = float(ema_slope)
+
+    # trend strength (keep)
+    DIFF_MIN_LONG = 0.00050
+    SLOPE_MIN_LONG = 0.00002
+    DIFF_MIN_SHORT = 0.00080
+    SLOPE_MIN_SHORT = 0.00080
+
+    if allowed_side == "long":
+        if not (ema_diff >= DIFF_MIN_LONG and ema_slope >= SLOPE_MIN_LONG):
+            return Signal(f.instId, f.ts, "flat", "weak_uptrend")
+    else:
+        if not (ema_diff <= -DIFF_MIN_SHORT and ema_slope <= -SLOPE_MIN_SHORT):
+            return Signal(f.instId, f.ts, "flat", "weak_downtrend")
+
+    MAX_DIFF_LONG = 0.0105
+    if allowed_side == "long" and ema_diff > MAX_DIFF_LONG:
+        return Signal(f.instId, f.ts, "flat", "long_overextended")
+
+    doi = getattr(f, "doi", None)
+    if doi is None:
+        return Signal(f.instId, f.ts, "flat", "no_doi")
+    doi = float(doi)
+    if allowed_side == "short" and doi < 0.0:
+        return Signal(f.instId, f.ts, "flat", "short_doi_negative")
+
+    # ===== flow / fast-react score =====
+    flow60 = int(getattr(f, "flow_60s", 0) or 0)
+    spike = float(getattr(f, "flow_spike", 0.0) or 0.0)
+    tc5 = int(getattr(f, "trade_count_sum_5s", 0) or 0)
+    act5 = int(getattr(f, "active_seconds_5s", 0) or 0)
+    range60 = float(f.range_60s_pct) if f.range_60s_pct is not None else None
+    std60 = float(f.ret_std_60s) if f.ret_std_60s is not None else None
+
+    SPIKE_MIN_LONG = 1.40
+    SPIKE_MIN_SHORT = 1.60
+    spike_min = SPIKE_MIN_LONG if allowed_side == "long" else SPIKE_MIN_SHORT
+    spike_ok = (spike is not None and spike >= spike_min)
+
+    score = 0
+    if flow60 >= 60:
+        score += 1
+    if flow60 >= 90:
+        score += 1
+    if tc5 >= 2 and act5 >= 1:
+        score += 1
+    if range60 is not None and range60 >= 0.00045:
+        score += 1
+    if std60 is not None and std60 >= 0.000040:
+        score += 1
+    if spike_ok:
+        score += 1
+
+    # ===== entry trigger first (needed for "soft flow gate" on longs) =====
+    dz = float(f.delta_rate_z or 0.0)
+    imb = float(f.imb_shift or 0.0)
+    mark_z_now = getattr(f, "mark_dev_z", None)
+
+    dz_thr = 1.05 if spike_ok else 1.15
+    imb_thr = 0.050
+
+    if allowed_side == "long":
+        dz_thr += 0.10
+        imb_thr += 0.015
+    else:
+        if not spike_ok:
+            dz_thr += 0.20
+
+    # ===== flow gate (asymmetric: LONGS softer) =====
+    if allowed_side == "long":
+        # allow score>=1 if trigger is strong (otherwise too few trades)
+        strong_trigger = (dz >= (dz_thr + 0.35) and imb >= (imb_thr + 0.03))
+        if score < 2 and not (score >= 1 and strong_trigger):
+            return Signal(f.instId, f.ts, "flat", "no_flow_confirm")
+    else:
+        # SAFE short loosening:
+        # allow score==1 only if impulse is clearly strong AND flow baseline is not dead.
+        strong_impulse = (dz <= -(dz_thr + 0.40) and imb <= -(imb_thr + 0.05))
+        flow_ok = (flow60 >= 55) or (tc5 >= 3 and act5 >= 2)
+
+        if score < 2 and not (score >= 1 and flow_ok and strong_impulse):
+            return Signal(f.instId, f.ts, "flat", "no_flow_confirm")
+
+    # ATR gate secondary
     if atr_pct < vol_gate:
-        if not (fast_vol and fast_flow):
+        fast_ok = (range60 is not None and range60 >= 0.00055) or (std60 is not None and std60 >= 0.000050)
+        if not fast_ok:
             return Signal(f.instId, f.ts, "flat", "low_vol")
 
-    # ---- FLOW GATE (ROBUST) ----
-    flow60 = f.flow_60s or 0
-    spike = float(f.flow_spike or 0.0)
+    # ===== long quality filters (relaxed but still effective) =====
+    if allowed_side == "long":
+        ret_15m_before = getattr(f, "ret_15m_before", None)
+        dist_from_15m_high = getattr(f, "dist_from_15m_high", None)
+        dz_mean_15s_before = getattr(f, "dz_mean_15s_before", None)
+        mark_z = getattr(f, "mark_dev_z", None)
 
-    # базовая ликвидность ~2 трейда/сек
-    # print('flow60:',flow60,'spike:',spike)
-    if flow60 < 120 and spike < 1.6:
-        return Signal(f.instId, f.ts, "flat", "no_flow")
+        # late entry keep
+        if ret_15m_before is not None and float(ret_15m_before) > 0.015:
+            return Signal(f.instId, f.ts, "flat", "long_late_entry_15m")
 
-    # ускорение в последние секунды
-    if f.trade_count_sum_5s < 2 and spike < 1.6:
-        return Signal(f.instId, f.ts, "flat", "no_flow")
+        # near-high tighter (0.10% -> 0.06%)
+        if dist_from_15m_high is not None and float(dist_from_15m_high) < 0.0006:
+            return Signal(f.instId, f.ts, "flat", "long_near_15m_high")
 
-    # ---- TRIGGER ----
-    dz = f.delta_rate_z or 0.0
-    imb = f.imb_shift or 0.0
-    mark_z = f.mark_dev_z
+        # dz fading relaxed (2.0 -> 1.4)
+        if dz_mean_15s_before is not None and float(dz_mean_15s_before) < 1.4:
+            return Signal(f.instId, f.ts, "flat", "long_dz_fading")
 
-    dz_thr = 1.0 if mark_z is not None else 1.5
+        # mark overpriced: only kill if ALSO near-high (avoid deleting continuations)
+        if (mark_z is not None and float(mark_z) > 0.8) and (dist_from_15m_high is not None and float(dist_from_15m_high) < 0.0015):
+            return Signal(f.instId, f.ts, "flat", "long_mark_overpriced")
 
-    long_ok = dz > dz_thr and imb > 0.05 and (mark_z is None or mark_z > -1.5)
-    short_ok = dz < -dz_thr and imb < -0.05 and (mark_z is None or mark_z < 1.5)
+        # keep stretch guard
+        if ema_diff > 0.0065 and dz < 3.0:
+            return Signal(f.instId, f.ts, "flat", "long_weak_dz_in_stretch")
 
-    if not long_ok and not short_ok:
-        return Signal(f.instId, f.ts, "flat", "no_trigger")
+        ok = (dz >= dz_thr) and (imb >= imb_thr) and (mark_z_now is None or float(mark_z_now) > -1.0)
+        if not ok:
+            return Signal(f.instId, f.ts, "flat", "no_trigger")
+        side = "long"
+    else:
+        # shorts unchanged
+        ok = (dz <= -dz_thr) and (imb <= -imb_thr) and (mark_z_now is None or float(mark_z_now) < 1.8)
+        if not ok:
+            return Signal(f.instId, f.ts, "flat", "no_trigger")
+        side = "short"
 
-    side = "long" if long_ok else "short"
+    # ===== exits / risk =====
+    impulse = spike_ok or (score >= 4)
+    sl_atr = max(0.0032, min(0.0100, 0.95 * atr_pct))
 
-    sl = max(0.0035, min(0.0120, 0.9 * atr_pct))
-    tp = max(0.0100, min(0.0200, 2.0 * sl))
-    tr_start = max(0.0060, min(0.0150, 0.8 * tp))
-    tr_step = max(0.0015, min(0.0040, 0.35 * sl))
+    if impulse:
+        sl = max(sl_atr, 0.0055)
+        sl = min(sl, 0.0140)
+        tp = max(0.0130, min(0.0350, 2.1 * sl))
+        tr_start = max(0.0060, min(0.0200, 0.55 * tp))
+        tr_step = max(0.0016, min(0.0060, 0.26 * sl))
+    else:
+        sl = max(sl_atr, 0.0035)
+        tp = max(0.0100, min(0.0220, 2.0 * sl))
+        tr_start = max(0.0042, min(0.0120, 0.52 * tp))
+        tr_step = max(0.0012, min(0.0045, 0.30 * sl))
+
+    breakeven_at = 0.0030
+    breakeven_offset = 0.0014
 
     reason = (
-        f"dz={dz:.2f} imb={imb:.3f} atr={atr_pct:.4f} "
-        f"flow5s={f.trade_count_sum_5s}/{f.active_seconds_5s} "
-        f"flow60={flow60} spike={spike:.2f} "
-        f"fastR={f.range_60s_pct or 0:.4f} fastStd={f.ret_std_60s or 0:.6f}"
+        f"trend={int(trend_dir)}({allowed_side}) doi={doi:+.2f} "
+        f"diff={ema_diff:+.5f} slope={ema_slope:+.6f} "
+        f"spike={spike:.2f}(ok={1 if spike_ok else 0}) score={score} imp={1 if impulse else 0} "
+        f"dz={dz:.2f}(thr={dz_thr:.2f}) imb={imb:.3f}(thr={imb_thr:.3f}) "
+        f"atr={atr_pct:.4f} flow60={flow60} tc5={tc5}/{act5} "
+        f"R60={(range60 or 0.0):.4f} Std60={(std60 or 0.0):.6f}"
     )
 
     return Signal(
@@ -103,7 +222,11 @@ def decide(f: FeatureRow, vol_gate: float = 0.0015) -> Signal:
         take_profit=tp,
         trailing_start=tr_start,
         trailing_step=tr_step,
+        breakeven_at=breakeven_at,
+        breakeven_offset=breakeven_offset,
     )
+
+
 
 
 # =========================
@@ -118,8 +241,9 @@ def run(db_path: str, symbols: List[str], every: int):
         "spread": 0,
         "no_price": 0,
         "no_atr": 0,
+        "no_flow_confirm": 0,
+        "no_flow_5s": 0,
         "low_vol": 0,
-        "no_flow": 0,
         "no_trigger": 0,
         "cooldown": 0,
         "signals": 0,
@@ -153,12 +277,12 @@ def run(db_path: str, symbols: List[str], every: int):
 
             # store snapshot for debug
             last_flow_debug[instId] = {
-                "flow60": f.flow_60s,
-                "spike": f.flow_spike,
-                "tc5": f.trade_count_sum_5s,
-                "act5": f.active_seconds_5s,
-                "range60": f.range_60s_pct,
-                "retstd60": f.ret_std_60s,
+                "flow60": getattr(f, "flow_60s", None),
+                "spike": getattr(f, "flow_spike", None),
+                "tc5": getattr(f, "trade_count_sum_5s", None),
+                "act5": getattr(f, "active_seconds_5s", None),
+                "range60": getattr(f, "range_60s_pct", None),
+                "retstd60": getattr(f, "ret_std_60s", None),
             }
 
             sig = decide(f)
@@ -177,9 +301,10 @@ def run(db_path: str, symbols: List[str], every: int):
             stats["entries"] += 1
 
             print(
-                f"[{time.strftime('%H:%M:%S')}] {instId.upper()} {sig.side.upper()} "
+                f"[{datetime.now(MSK).strftime('%H:%M:%S')}] {instId.upper()} {sig.side.upper()} "
                 f"SL={sig.stop_loss:.4f} TP={sig.take_profit:.4f} "
-                f"TR={sig.trailing_start:.4f}/{sig.trailing_step:.4f} :: {sig.reason}"
+                f"TR={sig.trailing_start:.4f}/{sig.trailing_step:.4f} "
+                f"BE={sig.breakeven_at:.4f}@{sig.breakeven_offset:.4f} :: {sig.reason}"
             )
 
         # periodic report

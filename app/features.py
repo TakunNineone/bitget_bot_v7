@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 import math
 from dataclasses import dataclass
-from typing import Optional, List, Any
+from typing import Optional, List, Any, Tuple
 
 
 @dataclass
@@ -42,6 +42,25 @@ class FeatureRow:
     ret_std_60s: Optional[float]
     flow_60s: int
     flow_spike: Optional[float]
+    flow_accel_30s: Optional[float]  # NEW
+
+    # NEW: 15m trend (regime)
+    ema_fast_15m: Optional[float]
+    ema_slow_15m: Optional[float]
+    ema_diff_15m: Optional[float]          # (fast - slow) / price
+    ema_slope_15m: Optional[float]         # slope of fast EMA (pct per candle)
+    trend_dir_15m: Optional[int]           # +1 up, -1 down, 0 unknown/flat
+
+    # NEW: entry context (for better long filtering)
+    ret_1m_before: Optional[float]
+    ret_5m_before: Optional[float]
+    ret_15m_before: Optional[float]
+    dist_from_15m_high: Optional[float]
+    dist_from_15m_low: Optional[float]
+    dz_mean_5s_before: Optional[float]
+    dz_mean_15s_before: Optional[float]
+    imb_mean_5s_before: Optional[float]
+    imb_mean_15s_before: Optional[float]
 
 
 def _safe_float(x: Any) -> Optional[float]:
@@ -80,27 +99,39 @@ class FeatureService:
         trade_count_sum_5s = sum(int(r["trade_count"] or 0) for r in last5)
         active_seconds_5s = sum(1 for r in last5 if (r["trade_count"] or 0) > 0)
 
-        # delta z (based on delta_vol window)
+        # delta series
         deltas = [_safe_float(r["delta_vol"]) for r in micro if r["delta_vol"] is not None]
         delta_vol = deltas[-1] if deltas else None
 
-        delta_rate_z = None
-        if delta_vol is not None and len(deltas) >= 20:
-            mu = sum(deltas) / len(deltas)
-            var = sum((x - mu) ** 2 for x in deltas) / (len(deltas) - 1)
-            std = math.sqrt(var) if var > 0 else None
-            if std and std > 0:
-                delta_rate_z = (delta_vol - mu) / std
+        # Prefer stored delta_rate_z if present in agg_1s_micro (faster + consistent)
+        delta_rate_z = _safe_float(last.get("delta_rate_z")) if isinstance(last, dict) else None
+        if delta_rate_z is None:
+            # compute z on the fly (fallback)
+            if delta_vol is not None and len(deltas) >= 20:
+                mu = sum(deltas) / len(deltas)
+                var = sum((x - mu) ** 2 for x in deltas) / (len(deltas) - 1)
+                std = math.sqrt(var) if var > 0 else None
+                if std and std > 0:
+                    delta_rate_z = (delta_vol - mu) / std
 
         # imbalance shift
         imbs = [_safe_float(r["imbalance15"]) for r in micro if r["imbalance15"] is not None]
         imbalance15 = imbs[-1] if imbs else None
-        imb_shift = (imbs[-1] - imbs[-2]) if len(imbs) >= 2 else None
+
+        imb_shift = None
+        # Prefer stored imb_shift column if exists in agg_1s_micro
+        try:
+            imb_shift = _safe_float(last["imb_shift"])
+        except Exception:
+            imb_shift = (imbs[-1] - imbs[-2]) if len(imbs) >= 2 else None
 
         # ATR15m from raw candles
         atr15m = self._fetch_atr_15m(instId, sec_ts)
 
-        # Context: mark/index/oi/doi/funding + mark_dev_z derived
+        # 15m trend regime
+        ema_fast_15m, ema_slow_15m, ema_diff_15m, ema_slope_15m, trend_dir_15m = self._fetch_trend_15m(instId, sec_ts)
+
+        # Context
         ctx = self._fetch_context(instId, sec_ts)
         mark_last = ctx["mark_last"]
         index_last = ctx["index_last"]
@@ -145,10 +176,29 @@ class FeatureService:
                 ret_std_60s = math.sqrt(var)
 
         # flow spike: compare last 60s to average 60s over last ~10m
-        last600 = micro  # already up to 600s
+        last600 = micro  # up to 600s
         flow_10m = sum(int(r["trade_count"] or 0) for r in last600)
         avg_flow_60s = flow_10m / max(1.0, len(last600) / 60.0)
         flow_spike = (flow_60s / avg_flow_60s) if avg_flow_60s > 0 else None
+
+        # NEW: flow accel 30s = flow60(now) - flow60(ending 30s ago)
+        flow_accel_30s = None
+        if len(last600) >= 90:
+            win_now = last600[-60:]
+            win_prev = last600[-90:-30]
+            f_now = sum(int(r["trade_count"] or 0) for r in win_now)
+            f_prev = sum(int(r["trade_count"] or 0) for r in win_prev)
+            flow_accel_30s = float(f_now - f_prev)
+
+        # NEW: returns before entry (need data older than 10m => query DB)
+        ret_1m_before, ret_5m_before, ret_15m_before = self._fetch_returns_before(instId, sec_ts)
+
+        # NEW: distance from 15m extremes
+        dist_from_15m_high, dist_from_15m_low = self._fetch_dist_from_15m_extremes(instId, sec_ts)
+
+        # NEW: micro means before (use stored columns if present; fallback)
+        dz_mean_5s_before, dz_mean_15s_before = self._fetch_micro_mean_before(instId, sec_ts, ["delta_rate_z", "delta_vol"])
+        imb_mean_5s_before, imb_mean_15s_before = self._fetch_micro_mean_before(instId, sec_ts, ["imb_shift", "imbalance15"])
 
         return FeatureRow(
             instId=instId,
@@ -180,6 +230,23 @@ class FeatureService:
             ret_std_60s=ret_std_60s,
             flow_60s=flow_60s,
             flow_spike=flow_spike,
+            flow_accel_30s=flow_accel_30s,
+
+            ema_fast_15m=ema_fast_15m,
+            ema_slow_15m=ema_slow_15m,
+            ema_diff_15m=ema_diff_15m,
+            ema_slope_15m=ema_slope_15m,
+            trend_dir_15m=trend_dir_15m,
+
+            ret_1m_before=ret_1m_before,
+            ret_5m_before=ret_5m_before,
+            ret_15m_before=ret_15m_before,
+            dist_from_15m_high=dist_from_15m_high,
+            dist_from_15m_low=dist_from_15m_low,
+            dz_mean_5s_before=dz_mean_5s_before,
+            dz_mean_15s_before=dz_mean_15s_before,
+            imb_mean_5s_before=imb_mean_5s_before,
+            imb_mean_15s_before=imb_mean_15s_before,
         )
 
     # -------------------------
@@ -200,8 +267,87 @@ class FeatureService:
         rows.reverse()  # chronological
         return rows
 
+    def _fetch_mid_at(self, instId: str, ts_ms: int) -> Optional[float]:
+        r = self.conn.execute(
+            """
+            SELECT mid
+            FROM agg_1s_micro
+            WHERE instId=? AND sec_ts<=?
+            ORDER BY sec_ts DESC
+            LIMIT 1
+            """,
+            (instId, ts_ms),
+        ).fetchone()
+        if not r:
+            return None
+        return _safe_float(r[0])
+
+    def _fetch_returns_before(self, instId: str, sec_ts: int) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+        px_e = self._fetch_mid_at(instId, sec_ts)
+        if px_e is None or px_e == 0:
+            return None, None, None
+
+        px_1m = self._fetch_mid_at(instId, sec_ts - 60_000)
+        px_5m = self._fetch_mid_at(instId, sec_ts - 5 * 60_000)
+        px_15m = self._fetch_mid_at(instId, sec_ts - 15 * 60_000)
+
+        def ch(a: Optional[float], b: Optional[float]) -> Optional[float]:
+            if a is None or b is None or b == 0:
+                return None
+            return (a - b) / b
+
+        return _safe_float(ch(px_e, px_1m)), _safe_float(ch(px_e, px_5m)), _safe_float(ch(px_e, px_15m))
+
+    def _fetch_dist_from_15m_extremes(self, instId: str, sec_ts: int) -> Tuple[Optional[float], Optional[float]]:
+        rows = self.conn.execute(
+            """
+            SELECT mid
+            FROM agg_1s_micro
+            WHERE instId=? AND sec_ts>? AND sec_ts<=? AND mid IS NOT NULL
+            """,
+            (instId, sec_ts - 15 * 60_000, sec_ts),
+        ).fetchall()
+        if not rows or len(rows) < 10:
+            return None, None
+        mids = [float(r[0]) for r in rows if r[0] is not None]
+        if not mids:
+            return None, None
+
+        px = mids[-1]
+        if px == 0:
+            return None, None
+        hi = max(mids)
+        lo = min(mids)
+        return _safe_float((hi - px) / px), _safe_float((px - lo) / px)
+
+    def _fetch_micro_mean_before(self, instId: str, sec_ts: int, cols_try: List[str]) -> Tuple[Optional[float], Optional[float]]:
+        # pick first existing column
+        chosen = None
+        for c in cols_try:
+            try:
+                # quick probe
+                self.conn.execute(f"SELECT {c} FROM agg_1s_micro LIMIT 1")
+                chosen = c
+                break
+            except Exception:
+                continue
+        if chosen is None:
+            return None, None
+
+        def mean_window(ms_back: int) -> Optional[float]:
+            r = self.conn.execute(
+                f"""
+                SELECT AVG({chosen})
+                FROM agg_1s_micro
+                WHERE instId=? AND sec_ts>? AND sec_ts<? AND {chosen} IS NOT NULL
+                """,
+                (instId, sec_ts - ms_back, sec_ts),
+            ).fetchone()
+            return _safe_float(r[0]) if r else None
+
+        return mean_window(5_000), mean_window(15_000)
+
     def _fetch_atr_15m(self, instId: str, sec_ts: int) -> Optional[float]:
-        # ATR(14) computed from raw 15m candles
         cur = self.conn.execute(
             """
             SELECT o, h, l, c
@@ -241,8 +387,81 @@ class FeatureService:
 
         return atr
 
+    @staticmethod
+    def _ema(values: List[float], period: int) -> Optional[float]:
+        if not values or len(values) < period:
+            return None
+        k = 2.0 / (period + 1.0)
+        ema = sum(values[:period]) / period
+        for v in values[period:]:
+            ema = (v - ema) * k + ema
+        return ema
+
+    def _fetch_trend_15m(self, instId: str, sec_ts: int) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], Optional[int]]:
+        cur = self.conn.execute(
+            """
+            SELECT candle_ts, c
+            FROM raw_ws_candle
+            WHERE instId=? AND interval='candle15m' AND candle_ts<=?
+            ORDER BY candle_ts DESC
+            LIMIT 220
+            """,
+            (instId, sec_ts),
+        )
+        rows = cur.fetchall()
+        if not rows:
+            return None, None, None, None, None
+
+        rows = list(reversed(rows))
+        closes: List[float] = []
+        for r in rows:
+            try:
+                closes.append(float(r["c"]))
+            except Exception:
+                continue
+
+        if len(closes) < 60:
+            return None, None, None, None, None
+
+        ema_fast = self._ema(closes, 20)
+        ema_slow = self._ema(closes, 50)
+        if ema_fast is None or ema_slow is None:
+            return None, None, None, None, None
+
+        price = closes[-1]
+        ema_diff = None
+        if price and price > 0:
+            ema_diff = (ema_fast - ema_slow) / price
+
+        period = 20
+        k = 2.0 / (period + 1.0)
+        seed = sum(closes[:period]) / period
+        ema_series: List[float] = [seed]
+        ema = seed
+        for v in closes[period:]:
+            ema = (v - ema) * k + ema
+            ema_series.append(ema)
+
+        ema_slope = None
+        if len(ema_series) >= 12:
+            y0 = ema_series[-12]
+            y1 = ema_series[-1]
+            base = ema_series[-1]
+            if base and base != 0:
+                ema_slope = (y1 - y0) / abs(base) / 11.0
+
+        trend_dir = 0
+        if ema_diff is not None:
+            if ema_diff > 0.0004:
+                trend_dir = 1
+            elif ema_diff < -0.0004:
+                trend_dir = -1
+            else:
+                trend_dir = 0
+
+        return float(ema_fast), float(ema_slow), _safe_float(ema_diff), _safe_float(ema_slope), int(trend_dir)
+
     def _fetch_context(self, instId: str, sec_ts: int) -> dict:
-        # align to minute
         min_ts = sec_ts - (sec_ts % 60000)
 
         cur = self.conn.execute(
@@ -274,7 +493,6 @@ class FeatureService:
         doi = _safe_float(latest["doi"])
         funding = _safe_float(latest["funding"])
 
-        # compute mark deviation zscore over up to last 60 minutes
         devs: List[float] = []
         for r in rows[:60]:
             m = _safe_float(r["mark_last"])

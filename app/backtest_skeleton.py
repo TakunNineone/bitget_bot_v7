@@ -12,6 +12,7 @@ from datetime import datetime, timezone, timedelta
 
 MSK = timezone(timedelta(hours=3))
 
+
 @dataclass
 class VirtualPosition:
     instId: str
@@ -22,6 +23,15 @@ class VirtualPosition:
     take_profit: float
     trailing_start: float
     trailing_step: float
+
+    # NEW: Break-even controls (copied from Signal)
+    breakeven_at: Optional[float] = None
+    breakeven_offset: Optional[float] = None
+    be_active: bool = False
+    be_price: Optional[float] = None
+
+    # keep entry reason for DB record
+    signal_reason: Optional[str] = None
 
     best_pnl: float = 0.0
     worst_pnl: float = 0.0
@@ -36,13 +46,40 @@ def pnl_frac(pos: VirtualPosition, price: float) -> float:
 
 
 def should_exit_and_update_trail(pos: VirtualPosition, price: float) -> Optional[str]:
+    """
+    Exit priority:
+      1) Break-even (if activated)
+      2) Stop-loss
+      3) Take-profit
+      4) Trailing stop
+    """
     p = pnl_frac(pos, price)
 
+    # ---- BREAK-EVEN activation ----
+    if (not pos.be_active) and (pos.breakeven_at is not None) and p >= float(pos.breakeven_at):
+        pos.be_active = True
+        off = float(pos.breakeven_offset or 0.0)
+        if pos.side == "long":
+            pos.be_price = pos.entry_price * (1.0 + off)
+        else:
+            pos.be_price = pos.entry_price * (1.0 - off)
+
+    # ---- BREAK-EVEN exit ----
+    if pos.be_active and pos.be_price is not None:
+        if pos.side == "long" and price <= pos.be_price:
+            return "BE"
+        if pos.side == "short" and price >= pos.be_price:
+            return "BE"
+
+    # ---- STOP LOSS ----
     if p <= -pos.stop_loss:
         return "SL"
+
+    # ---- TAKE PROFIT ----
     if p >= pos.take_profit:
         return "TP"
 
+    # ---- TRAILING ----
     if (not pos.trail_active) and p >= pos.trailing_start:
         pos.trail_active = True
         if pos.side == "long":
@@ -206,7 +243,11 @@ def backtest(
 
                 reason = should_exit_and_update_trail(pos, px)
                 if reason:
-                    insert_trade(conn, sym, pos, sec_ts, px, reason, fee_usd, notional, None)
+                    insert_trade(
+                        conn, sym, pos, sec_ts, px, reason,
+                        fee_usd, notional,
+                        pos.signal_reason
+                    )
                     conn.commit()
                     closed += 1
                     pos = None
@@ -230,10 +271,12 @@ def backtest(
                 take_profit=float(sig.take_profit or 0.0),
                 trailing_start=float(sig.trailing_start or 0.0),
                 trailing_step=float(sig.trailing_step or 0.0),
+                breakeven_at=float(sig.breakeven_at) if sig.breakeven_at is not None else None,
+                breakeven_offset=float(sig.breakeven_offset) if sig.breakeven_offset is not None else None,
+                signal_reason=sig.reason,
             )
             last_entry_ts = sec_ts
             signals += 1
-            # store reason on entry in-memory if you want; for now keep None in DB
 
         # force exit at end
         if pos is not None:
@@ -243,7 +286,11 @@ def backtest(
             if f_last:
                 px_last = f_last.mid if f_last.mid is not None else f_last.vwap
             if px_last is not None:
-                insert_trade(conn, sym, pos, last_ts, float(px_last), "FORCE_EXIT", fee_usd, notional, None)
+                insert_trade(
+                    conn, sym, pos, last_ts, float(px_last), "FORCE_EXIT",
+                    fee_usd, notional,
+                    pos.signal_reason
+                )
                 conn.commit()
                 closed += 1
             pos = None
@@ -280,6 +327,7 @@ def main():
     )
 
     print("\nDone. Results in backtest_trades.")
+    print("Tip: SL should reduce, and BE exits should appear if breakeven logic is active.")
 
 
 if __name__ == "__main__":
