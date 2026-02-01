@@ -1,7 +1,7 @@
 from __future__ import annotations
 import os
 import sqlite3
-from typing import Iterable, Dict, Any, List, Optional, Tuple
+from typing import List, Tuple
 
 SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
@@ -122,6 +122,23 @@ CREATE TABLE IF NOT EXISTS agg_1m_context (
   funding REAL,
   PRIMARY KEY (instId, min_ts)
 );
+
+-- Агрегаты (15m trend/regime)
+CREATE TABLE IF NOT EXISTS agg_15m_trend (
+  instId TEXT NOT NULL,
+  candle_ts INTEGER NOT NULL,
+  close REAL,
+  atr14 REAL,
+  ema20 REAL,
+  ema50 REAL,
+  ema_diff REAL,
+  ema_slope REAL,
+  trend_dir INTEGER,
+  PRIMARY KEY (instId, candle_ts)
+);
+
+CREATE INDEX IF NOT EXISTS idx_agg_15m_trend_inst_ts
+  ON agg_15m_trend(instId, candle_ts);
 """
 
 class SQLiteStore:
@@ -205,5 +222,11 @@ class SQLiteStore:
     def put_agg_1m_context(self, rows: List[Tuple]) -> None:
         self.insert_many(
             "INSERT OR REPLACE INTO agg_1m_context(instId,min_ts,mark_last,index_last,oi,doi,funding) VALUES (?,?,?,?,?,?,?)",
+            rows,
+        )
+
+    def put_agg_15m_trend(self, rows: List[Tuple]) -> None:
+        self.insert_many(
+            "INSERT OR REPLACE INTO agg_15m_trend(instId,candle_ts,close,atr14,ema20,ema50,ema_diff,ema_slope,trend_dir) VALUES (?,?,?,?,?,?,?,?,?)",
             rows,
         )

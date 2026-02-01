@@ -67,7 +67,7 @@ def decide(f: FeatureRow, vol_gate: float = 0.0015) -> Signal:
     DIFF_MIN_LONG = 0.00050
     SLOPE_MIN_LONG = 0.00002
     DIFF_MIN_SHORT = 0.00080
-    SLOPE_MIN_SHORT = 0.00080
+    SLOPE_MIN_SHORT = 0.00035
 
     if allowed_side == "long":
         if not (ema_diff >= DIFF_MIN_LONG and ema_slope >= SLOPE_MIN_LONG):

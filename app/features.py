@@ -125,11 +125,8 @@ class FeatureService:
         except Exception:
             imb_shift = (imbs[-1] - imbs[-2]) if len(imbs) >= 2 else None
 
-        # ATR15m from raw candles
-        atr15m = self._fetch_atr_15m(instId, sec_ts)
-
-        # 15m trend regime
-        ema_fast_15m, ema_slow_15m, ema_diff_15m, ema_slope_15m, trend_dir_15m = self._fetch_trend_15m(instId, sec_ts)
+        # 15m trend/regime (materialized in DB by app/trend_15m.py)
+        atr15m, ema_fast_15m, ema_slow_15m, ema_diff_15m, ema_slope_15m, trend_dir_15m = self._fetch_15m_trend_row(instId, sec_ts)
 
         # Context
         ctx = self._fetch_context(instId, sec_ts)
@@ -325,7 +322,6 @@ class FeatureService:
         chosen = None
         for c in cols_try:
             try:
-                # quick probe
                 self.conn.execute(f"SELECT {c} FROM agg_1s_micro LIMIT 1")
                 chosen = c
                 break
@@ -347,119 +343,38 @@ class FeatureService:
 
         return mean_window(5_000), mean_window(15_000)
 
-    def _fetch_atr_15m(self, instId: str, sec_ts: int) -> Optional[float]:
-        cur = self.conn.execute(
-            """
-            SELECT o, h, l, c
-            FROM raw_ws_candle
-            WHERE instId=? AND interval='candle15m' AND candle_ts<=?
-            ORDER BY candle_ts DESC
-            LIMIT 100
-            """,
-            (instId, sec_ts),
+    def _fetch_15m_trend_row(
+        self, instId: str, sec_ts: int
+    ) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[int]]:
+        """Fetch the latest 15m regime row <= sec_ts from materialized table.
+
+        Returns: (atr14, ema20, ema50, ema_diff, ema_slope, trend_dir)
+        """
+        try:
+            r = self.conn.execute(
+                """
+                SELECT atr14, ema20, ema50, ema_diff, ema_slope, trend_dir
+                FROM agg_15m_trend
+                WHERE instId=? AND candle_ts<=?
+                ORDER BY candle_ts DESC
+                LIMIT 1
+                """,
+                (instId, sec_ts),
+            ).fetchone()
+        except Exception:
+            r = None
+
+        if not r:
+            return None, None, None, None, None, None
+
+        return (
+            _safe_float(r[0]),
+            _safe_float(r[1]),
+            _safe_float(r[2]),
+            _safe_float(r[3]),
+            _safe_float(r[4]),
+            int(r[5]) if r[5] is not None else None,
         )
-        rows = cur.fetchall()
-        if not rows:
-            return None
-
-        ohlc = []
-        for r in reversed(rows):
-            try:
-                o = float(r[0]); h = float(r[1]); l = float(r[2]); c = float(r[3])
-                ohlc.append((o, h, l, c))
-            except Exception:
-                continue
-
-        period = 14
-        if len(ohlc) < period + 1:
-            return None
-
-        trs = []
-        prev_close = ohlc[0][3]
-        for (_o, h, l, c) in ohlc[1:]:
-            tr = max(h - l, abs(h - prev_close), abs(l - prev_close))
-            trs.append(tr)
-            prev_close = c
-
-        atr = sum(trs[:period]) / period
-        for tr in trs[period:]:
-            atr = (atr * (period - 1) + tr) / period
-
-        return atr
-
-    @staticmethod
-    def _ema(values: List[float], period: int) -> Optional[float]:
-        if not values or len(values) < period:
-            return None
-        k = 2.0 / (period + 1.0)
-        ema = sum(values[:period]) / period
-        for v in values[period:]:
-            ema = (v - ema) * k + ema
-        return ema
-
-    def _fetch_trend_15m(self, instId: str, sec_ts: int) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], Optional[int]]:
-        cur = self.conn.execute(
-            """
-            SELECT candle_ts, c
-            FROM raw_ws_candle
-            WHERE instId=? AND interval='candle15m' AND candle_ts<=?
-            ORDER BY candle_ts DESC
-            LIMIT 220
-            """,
-            (instId, sec_ts),
-        )
-        rows = cur.fetchall()
-        if not rows:
-            return None, None, None, None, None
-
-        rows = list(reversed(rows))
-        closes: List[float] = []
-        for r in rows:
-            try:
-                closes.append(float(r["c"]))
-            except Exception:
-                continue
-
-        if len(closes) < 60:
-            return None, None, None, None, None
-
-        ema_fast = self._ema(closes, 20)
-        ema_slow = self._ema(closes, 50)
-        if ema_fast is None or ema_slow is None:
-            return None, None, None, None, None
-
-        price = closes[-1]
-        ema_diff = None
-        if price and price > 0:
-            ema_diff = (ema_fast - ema_slow) / price
-
-        period = 20
-        k = 2.0 / (period + 1.0)
-        seed = sum(closes[:period]) / period
-        ema_series: List[float] = [seed]
-        ema = seed
-        for v in closes[period:]:
-            ema = (v - ema) * k + ema
-            ema_series.append(ema)
-
-        ema_slope = None
-        if len(ema_series) >= 12:
-            y0 = ema_series[-12]
-            y1 = ema_series[-1]
-            base = ema_series[-1]
-            if base and base != 0:
-                ema_slope = (y1 - y0) / abs(base) / 11.0
-
-        trend_dir = 0
-        if ema_diff is not None:
-            if ema_diff > 0.0004:
-                trend_dir = 1
-            elif ema_diff < -0.0004:
-                trend_dir = -1
-            else:
-                trend_dir = 0
-
-        return float(ema_fast), float(ema_slow), _safe_float(ema_diff), _safe_float(ema_slope), int(trend_dir)
 
     def _fetch_context(self, instId: str, sec_ts: int) -> dict:
         min_ts = sec_ts - (sec_ts % 60000)

@@ -14,6 +14,7 @@ from .storage import SQLiteStore
 from .ws_client import WSShard
 from .rest_client import RestPoller
 from .aggregator import MicroAggregator
+from .trend_15m import rebuild_15m_trend, update_last_15m_trend
 
 logging.basicConfig(
     level=logging.INFO,
@@ -109,6 +110,13 @@ async def main_async(cfg: Dict[str, Any]) -> None:
             symbols=symbols,
             limit=warmup_limit,
         )
+        # Build 15m trend/regime layer once (so strategy/backtest doesn't compute on the fly)
+        for sym in symbols:
+            try:
+                n = rebuild_15m_trend(store.conn, sym, lookback=max(600, warmup_limit + 50))
+                log.info("Warmup %s: built agg_15m_trend rows=%d", sym, n)
+            except Exception as e:
+                log.warning("Warmup trend build failed %s: %s", sym, e)
     except Exception as e:
         log.warning("Warmup failed (continuing anyway): %s", e)
 
@@ -176,9 +184,16 @@ async def main_async(cfg: Dict[str, Any]) -> None:
                     if isinstance(item, list) and len(item) >= 6:
                         candle_ts = int(item[0])
                         o, h, l, c, v = map(str, item[1:6])
-                        buf_candle.append(
-                            (inst_type, instId, channel, candle_ts, recv_ts, o, h, l, c, v, json.dumps(item, separators=(",", ":")))
-                        )
+                        row = (inst_type, instId, channel, candle_ts, recv_ts, o, h, l, c, v, json.dumps(item, separators=(",", ":")))
+                        # For candle15m: write immediately and update agg_15m_trend (rare event, safe to do sync)
+                        if channel == "candle15m":
+                            store.put_raw_ws_candle([row])
+                            try:
+                                update_last_15m_trend(store.conn, instId, lookback=300)
+                            except Exception as e:
+                                log.warning("15m trend update failed %s: %s", instId, e)
+                        else:
+                            buf_candle.append(row)
                     elif isinstance(item, dict):
                         candle_ts = int(item.get("ts") or item.get("candleTime") or recv_ts)
                         o = str(item.get("open") or item.get("o") or "")
@@ -186,9 +201,15 @@ async def main_async(cfg: Dict[str, Any]) -> None:
                         l = str(item.get("low") or item.get("l") or "")
                         c = str(item.get("close") or item.get("c") or "")
                         v = str(item.get("vol") or item.get("v") or "")
-                        buf_candle.append(
-                            (inst_type, instId, channel, candle_ts, recv_ts, o, h, l, c, v, json.dumps(item, separators=(",", ":")))
-                        )
+                        row = (inst_type, instId, channel, candle_ts, recv_ts, o, h, l, c, v, json.dumps(item, separators=(",", ":")))
+                        if channel == "candle15m":
+                            store.put_raw_ws_candle([row])
+                            try:
+                                update_last_15m_trend(store.conn, instId, lookback=300)
+                            except Exception as e:
+                                log.warning("15m trend update failed %s: %s", instId, e)
+                        else:
+                            buf_candle.append(row)
 
         # flush raw buffers in batches
         if len(buf_ticker) >= 200:
