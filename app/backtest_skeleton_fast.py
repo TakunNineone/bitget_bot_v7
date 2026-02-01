@@ -183,6 +183,29 @@ def load_15m_candles(conn: sqlite3.Connection, instId: str) -> List[sqlite3.Row]
     return conn.execute(q, (instId,)).fetchall()
 
 
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    r = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+        (name,),
+    ).fetchone()
+    return r is not None
+
+
+def load_15m_trend(conn: sqlite3.Connection, instId: str) -> List[sqlite3.Row]:
+    """Load precomputed 15m regime from agg_15m_trend.
+
+    Columns expected:
+      candle_ts, atr14, ema20, ema50, ema_diff, ema_slope, trend_dir
+    """
+    q = """
+        SELECT candle_ts, atr14, ema20, ema50, ema_diff, ema_slope, trend_dir
+        FROM agg_15m_trend
+        WHERE instId=?
+        ORDER BY candle_ts ASC
+    """
+    return conn.execute(q, (instId,)).fetchall()
+
+
 def load_1m_context(conn: sqlite3.Connection, instId: str) -> List[sqlite3.Row]:
     q = """
         SELECT min_ts, mark_last, index_last, oi, doi, funding
@@ -463,16 +486,30 @@ def backtest_fast(
         imb_hist = deque(maxlen=15)          # last 15 seconds imb_shift
         tc_hist_90 = deque(maxlen=90)        # last 90 seconds trade_count (for flow_accel_30s)
 
-        candles15 = load_15m_candles(conn, sym)
-        if len(candles15) < 60:
-            print(f"{sym}: not enough 15m candles ({len(candles15)})")
-            continue
+        # ---- 15m regime source ----
+        # Prefer materialized agg_15m_trend (fast & consistent with live bot).
+        # Fallback: compute from raw_ws_candle if agg_15m_trend is missing.
+        use_db_trend = _table_exists(conn, "agg_15m_trend")
+        trend_rows: List[sqlite3.Row] = load_15m_trend(conn, sym) if use_db_trend else []
 
-        candle_ts, atr_series = compute_atr_series(candles15, period=14)
-        candle_ts2, ema_fast_s, ema_slow_s, ema_diff_s, ema_slope_s, trend_dir_s = compute_regime_series(candles15)
+        if trend_rows:
+            trend_ts = [int(r["candle_ts"]) for r in trend_rows]
+            atr_series = [float(r["atr14"]) if r["atr14"] is not None else None for r in trend_rows]
+            ema_fast_s = [float(r["ema20"]) if r["ema20"] is not None else None for r in trend_rows]
+            ema_slow_s = [float(r["ema50"]) if r["ema50"] is not None else None for r in trend_rows]
+            ema_diff_s = [float(r["ema_diff"]) if r["ema_diff"] is not None else None for r in trend_rows]
+            ema_slope_s = [float(r["ema_slope"]) if r["ema_slope"] is not None else None for r in trend_rows]
+            trend_dir_s = [int(r["trend_dir"]) if r["trend_dir"] is not None else None for r in trend_rows]
+        else:
+            candles15 = load_15m_candles(conn, sym)
+            if len(candles15) < 60:
+                print(f"{sym}: not enough 15m candles ({len(candles15)}) and no agg_15m_trend")
+                continue
+            trend_ts, atr_series = compute_atr_series(candles15, period=14)
+            _ts2, ema_fast_s, ema_slow_s, ema_diff_s, ema_slope_s, trend_dir_s = compute_regime_series(candles15)
 
-        if not candle_ts:
-            print(f"{sym}: cannot compute ATR series")
+        if not trend_ts:
+            print(f"{sym}: no 15m regime rows (agg_15m_trend empty and ATR compute failed)")
             continue
 
         ctx_rows = load_1m_context(conn, sym)
@@ -505,7 +542,7 @@ def backtest_fast(
             sec_ts = int(r["sec_ts"])
 
             # ---- attach 15m regime ----
-            while ptr_atr + 1 < len(candle_ts) and candle_ts[ptr_atr + 1] <= sec_ts:
+            while ptr_atr + 1 < len(trend_ts) and trend_ts[ptr_atr + 1] <= sec_ts:
                 ptr_atr += 1
 
             atr15m = atr_series[ptr_atr] if atr_series else None
