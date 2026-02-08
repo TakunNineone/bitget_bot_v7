@@ -100,8 +100,12 @@ CREATE TABLE IF NOT EXISTS agg_1s_micro (
   spread_bps REAL,
   microprice REAL,
   imbalance15 REAL,
+  imbalance5 REAL,
   top_bid_qty REAL,
   top_ask_qty REAL,
+  top5_bid_qty REAL,
+  top5_ask_qty REAL,
+  depth_ratio5 REAL,
   trade_count INTEGER,
   buy_vol REAL,
   sell_vol REAL,
@@ -139,6 +143,23 @@ CREATE TABLE IF NOT EXISTS agg_15m_trend (
 
 CREATE INDEX IF NOT EXISTS idx_agg_15m_trend_inst_ts
   ON agg_15m_trend(instId, candle_ts);
+
+CREATE TABLE IF NOT EXISTS agg_trend (
+  instId TEXT NOT NULL,
+  interval TEXT NOT NULL,
+  candle_ts INTEGER NOT NULL,
+  close REAL,
+  atr14 REAL,
+  ema20 REAL,
+  ema50 REAL,
+  ema_diff REAL,
+  ema_slope REAL,
+  trend_dir INTEGER,
+  PRIMARY KEY (instId, interval, candle_ts)
+);
+
+CREATE INDEX IF NOT EXISTS idx_agg_trend_inst_interval_ts
+  ON agg_trend(instId, interval, candle_ts);
 """
 
 class SQLiteStore:
@@ -148,6 +169,22 @@ class SQLiteStore:
         self.conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
         self.conn.execute("PRAGMA synchronous=NORMAL;")
         self.conn.executescript(SCHEMA_SQL)
+        self._ensure_columns()
+
+    def _ensure_columns(self) -> None:
+        needed = {
+            "agg_1s_micro": {
+                "imbalance5": "REAL",
+                "top5_bid_qty": "REAL",
+                "top5_ask_qty": "REAL",
+                "depth_ratio5": "REAL",
+            },
+        }
+        for table, cols in needed.items():
+            existing = {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+            for col, col_type in cols.items():
+                if col not in existing:
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
 
     def close(self) -> None:
         try:
@@ -215,7 +252,7 @@ class SQLiteStore:
 
     def put_agg_1s_micro(self, rows: List[Tuple]) -> None:
         self.insert_many(
-            "INSERT OR REPLACE INTO agg_1s_micro(instId,sec_ts,mid,spread,spread_bps,microprice,imbalance15,top_bid_qty,top_ask_qty,trade_count,buy_vol,sell_vol,delta_vol,vwap,ret_1s) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO agg_1s_micro(instId,sec_ts,mid,spread,spread_bps,microprice,imbalance15,imbalance5,top_bid_qty,top_ask_qty,top5_bid_qty,top5_ask_qty,depth_ratio5,trade_count,buy_vol,sell_vol,delta_vol,vwap,ret_1s) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             rows,
         )
 

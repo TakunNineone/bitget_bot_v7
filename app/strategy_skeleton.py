@@ -50,6 +50,11 @@ def decide(f: FeatureRow, vol_gate: float = 0.0015) -> Signal:
     px = float(px)
     atr_pct = float(f.atr15m) / px
 
+    # Liquidity / regime gate (15m)
+    tc15m = getattr(f, "trade_count_15m", None)
+    if tc15m is not None and int(tc15m) < 800:
+        return Signal(f.instId, f.ts, "flat", "low_liquidity_15m")
+
     trend_dir = getattr(f, "trend_dir_15m", None)
     if trend_dir is None or int(trend_dir) == 0:
         return Signal(f.instId, f.ts, "flat", "no_trend")
@@ -79,6 +84,17 @@ def decide(f: FeatureRow, vol_gate: float = 0.0015) -> Signal:
     MAX_DIFF_LONG = 0.0105
     if allowed_side == "long" and ema_diff > MAX_DIFF_LONG:
         return Signal(f.instId, f.ts, "flat", "long_overextended")
+
+    # Higher TF trend alignment (soft for 4h)
+    trend_1h = getattr(f, "trend_dir_1h", None)
+    if trend_1h is not None and int(trend_1h) != 0:
+        if int(trend_1h) != int(trend_dir):
+            return Signal(f.instId, f.ts, "flat", "trend_mismatch_1h")
+    trend_4h = getattr(f, "trend_dir_4h", None)
+    if trend_4h is not None and int(trend_4h) != 0:
+        # allow 4h neutral; block only if strongly opposite and 15m is weak
+        if int(trend_4h) != int(trend_dir) and abs(ema_diff) < 0.0035:
+            return Signal(f.instId, f.ts, "flat", "trend_mismatch_4h")
 
     doi = getattr(f, "doi", None)
     if doi is None:
@@ -118,6 +134,8 @@ def decide(f: FeatureRow, vol_gate: float = 0.0015) -> Signal:
     dz = float(f.delta_rate_z or 0.0)
     imb = float(f.imb_shift or 0.0)
     mark_z_now = getattr(f, "mark_dev_z", None)
+    imb5 = getattr(f, "imbalance5", None)
+    depth_ratio5 = getattr(f, "depth_ratio5", None)
 
     dz_thr = 1.05 if spike_ok else 1.15
     imb_thr = 0.050
@@ -150,10 +168,23 @@ def decide(f: FeatureRow, vol_gate: float = 0.0015) -> Signal:
         if not fast_ok:
             return Signal(f.instId, f.ts, "flat", "low_vol")
 
+    # Book depth confirmation (top5 imbalance)
+    if imb5 is not None:
+        if allowed_side == "long" and float(imb5) < 0.02:
+            return Signal(f.instId, f.ts, "flat", "weak_book_long")
+        if allowed_side == "short" and float(imb5) > -0.02:
+            return Signal(f.instId, f.ts, "flat", "weak_book_short")
+    if depth_ratio5 is not None:
+        if allowed_side == "long" and float(depth_ratio5) < 0.00:
+            return Signal(f.instId, f.ts, "flat", "depth_skew_short")
+        if allowed_side == "short" and float(depth_ratio5) > 0.00:
+            return Signal(f.instId, f.ts, "flat", "depth_skew_long")
+
     # ===== long quality filters (relaxed but still effective) =====
     if allowed_side == "long":
         ret_15m_before = getattr(f, "ret_15m_before", None)
         dist_from_15m_high = getattr(f, "dist_from_15m_high", None)
+        dist_from_15m_low = getattr(f, "dist_from_15m_low", None)
         dz_mean_15s_before = getattr(f, "dz_mean_15s_before", None)
         mark_z = getattr(f, "mark_dev_z", None)
 
@@ -164,6 +195,10 @@ def decide(f: FeatureRow, vol_gate: float = 0.0015) -> Signal:
         # near-high tighter (0.10% -> 0.06%)
         if dist_from_15m_high is not None and float(dist_from_15m_high) < 0.0006:
             return Signal(f.instId, f.ts, "flat", "long_near_15m_high")
+
+        # too close to low (avoid low bounce noise)
+        if dist_from_15m_low is not None and float(dist_from_15m_low) < 0.0004:
+            return Signal(f.instId, f.ts, "flat", "long_near_15m_low")
 
         # dz fading relaxed (2.0 -> 1.4)
         if dz_mean_15s_before is not None and float(dz_mean_15s_before) < 1.4:
@@ -183,6 +218,20 @@ def decide(f: FeatureRow, vol_gate: float = 0.0015) -> Signal:
         side = "long"
     else:
         # shorts unchanged
+        ret_15m_before = getattr(f, "ret_15m_before", None)
+        dist_from_15m_low = getattr(f, "dist_from_15m_low", None)
+        dz_mean_15s_before = getattr(f, "dz_mean_15s_before", None)
+        mark_z = getattr(f, "mark_dev_z", None)
+
+        if ret_15m_before is not None and float(ret_15m_before) < -0.015:
+            return Signal(f.instId, f.ts, "flat", "short_late_entry_15m")
+        if dist_from_15m_low is not None and float(dist_from_15m_low) < 0.0006:
+            return Signal(f.instId, f.ts, "flat", "short_near_15m_low")
+        if dz_mean_15s_before is not None and float(dz_mean_15s_before) > -1.4:
+            return Signal(f.instId, f.ts, "flat", "short_dz_fading")
+        if (mark_z is not None and float(mark_z) < -0.8) and (dist_from_15m_low is not None and float(dist_from_15m_low) < 0.0015):
+            return Signal(f.instId, f.ts, "flat", "short_mark_undervalued")
+
         ok = (dz <= -dz_thr) and (imb <= -imb_thr) and (mark_z_now is None or float(mark_z_now) < 1.8)
         if not ok:
             return Signal(f.instId, f.ts, "flat", "no_trigger")
@@ -192,17 +241,29 @@ def decide(f: FeatureRow, vol_gate: float = 0.0015) -> Signal:
     impulse = spike_ok or (score >= 4)
     sl_atr = max(0.0032, min(0.0100, 0.95 * atr_pct))
 
+    # flow-sensitive risk tuning
+    flow_boost = 0.0
+    if spike_ok:
+        flow_boost += 0.15
+    if score >= 4:
+        flow_boost += 0.10
+    if depth_ratio5 is not None:
+        if allowed_side == "long" and float(depth_ratio5) > 0.05:
+            flow_boost += 0.10
+        if allowed_side == "short" and float(depth_ratio5) < -0.05:
+            flow_boost += 0.10
+
     if impulse:
-        sl = max(sl_atr, 0.0055)
-        sl = min(sl, 0.0140)
-        tp = max(0.0130, min(0.0350, 2.1 * sl))
-        tr_start = max(0.0060, min(0.0200, 0.55 * tp))
-        tr_step = max(0.0016, min(0.0060, 0.26 * sl))
+        sl = max(sl_atr, 0.0052)
+        sl = min(sl, 0.0135)
+        tp = max(0.0135, min(0.0380, (2.0 + flow_boost) * sl))
+        tr_start = max(0.0060, min(0.0220, 0.52 * tp))
+        tr_step = max(0.0016, min(0.0062, 0.24 * sl))
     else:
-        sl = max(sl_atr, 0.0035)
-        tp = max(0.0100, min(0.0220, 2.0 * sl))
-        tr_start = max(0.0042, min(0.0120, 0.52 * tp))
-        tr_step = max(0.0012, min(0.0045, 0.30 * sl))
+        sl = max(sl_atr, 0.0036)
+        tp = max(0.0100, min(0.0240, (1.9 + 0.5 * flow_boost) * sl))
+        tr_start = max(0.0040, min(0.0130, 0.50 * tp))
+        tr_step = max(0.0012, min(0.0046, 0.30 * sl))
 
     breakeven_at = 0.0030
     breakeven_offset = 0.0014

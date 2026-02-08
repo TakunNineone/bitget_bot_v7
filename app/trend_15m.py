@@ -137,6 +137,21 @@ def _fetch_candles_15m(conn: sqlite3.Connection, instId: str, lookback: int) -> 
     return list(reversed(rows))
 
 
+def _fetch_candles_interval(
+    conn: sqlite3.Connection, instId: str, interval: str, lookback: int
+) -> List[sqlite3.Row]:
+    conn.row_factory = sqlite3.Row
+    q = """
+        SELECT candle_ts, o, h, l, c
+        FROM raw_ws_candle
+        WHERE instId=? AND interval=?
+        ORDER BY candle_ts DESC
+        LIMIT ?
+    """
+    rows = conn.execute(q, (instId, interval, int(lookback))).fetchall()
+    return list(reversed(rows))
+
+
 def rebuild_15m_trend(conn: sqlite3.Connection, instId: str, lookback: int = 600) -> int:
     """
     (Re)build agg_15m_trend from last N 15m candles.
@@ -190,6 +205,65 @@ def rebuild_15m_trend(conn: sqlite3.Connection, instId: str, lookback: int = 600
     return len(out_rows)
 
 
+def rebuild_trend_interval(
+    conn: sqlite3.Connection,
+    instId: str,
+    interval: str,
+    lookback: int = 600,
+) -> int:
+    """
+    Build agg_trend rows for a given interval (e.g., candle1h/candle4h).
+    Returns: number of rows upserted.
+    """
+    candles = _fetch_candles_interval(conn, instId, interval, lookback)
+    if not candles:
+        return 0
+
+    ts: List[int] = []
+    closes: List[float] = []
+    ohlc: List[Tuple[float, float, float, float]] = []
+
+    for r in candles:
+        candle_ts = int(r["candle_ts"])
+        o = _safe_float(r["o"]) or 0.0
+        h = _safe_float(r["h"]) or 0.0
+        l = _safe_float(r["l"]) or 0.0
+        c = _safe_float(r["c"]) or 0.0
+        ts.append(candle_ts)
+        closes.append(c)
+        ohlc.append((o, h, l, c))
+
+    atr14 = _compute_atr14(ohlc, period=14)
+    ema20 = _ema_series(closes, 20)
+    ema50 = _ema_series(closes, 50)
+    ema_diff, ema_slope, trend_dir = _compute_regime(closes, ema20, ema50)
+
+    out_rows: List[Tuple] = []
+    for i in range(len(ts)):
+        out_rows.append(
+            (
+                instId,
+                interval,
+                ts[i],
+                closes[i] if closes[i] != 0.0 else None,
+                atr14[i],
+                ema20[i],
+                ema50[i],
+                ema_diff[i],
+                ema_slope[i],
+                trend_dir[i],
+            )
+        )
+
+    conn.executemany(
+        """INSERT OR REPLACE INTO agg_trend
+           (instId,interval,candle_ts,close,atr14,ema20,ema50,ema_diff,ema_slope,trend_dir)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        out_rows,
+    )
+    return len(out_rows)
+
+
 def update_last_15m_trend(conn: sqlite3.Connection, instId: str, lookback: int = 300) -> int:
     """
     Incremental update: recompute trend on last N candles and upsert only last candle_ts.
@@ -236,6 +310,63 @@ def update_last_15m_trend(conn: sqlite3.Connection, instId: str, lookback: int =
         """INSERT OR REPLACE INTO agg_15m_trend
            (instId,candle_ts,close,atr14,ema20,ema50,ema_diff,ema_slope,trend_dir)
            VALUES (?,?,?,?,?,?,?,?,?)""",
+        row,
+    )
+    return 1
+
+
+def update_last_trend_interval(
+    conn: sqlite3.Connection,
+    instId: str,
+    interval: str,
+    lookback: int = 300,
+    min_candles: int = 60,
+) -> int:
+    """
+    Incremental update for agg_trend, upsert only last candle_ts.
+    Returns: 1 if updated, 0 otherwise.
+    """
+    candles = _fetch_candles_interval(conn, instId, interval, lookback)
+    if len(candles) < min_candles:
+        return 0
+
+    ts: List[int] = []
+    closes: List[float] = []
+    ohlc: List[Tuple[float, float, float, float]] = []
+
+    for r in candles:
+        candle_ts = int(r["candle_ts"])
+        o = _safe_float(r["o"]) or 0.0
+        h = _safe_float(r["h"]) or 0.0
+        l = _safe_float(r["l"]) or 0.0
+        c = _safe_float(r["c"]) or 0.0
+        ts.append(candle_ts)
+        closes.append(c)
+        ohlc.append((o, h, l, c))
+
+    atr14 = _compute_atr14(ohlc, period=14)
+    ema20 = _ema_series(closes, 20)
+    ema50 = _ema_series(closes, 50)
+    ema_diff, ema_slope, trend_dir = _compute_regime(closes, ema20, ema50)
+
+    i = len(ts) - 1
+    row = (
+        instId,
+        interval,
+        ts[i],
+        closes[i] if closes[i] != 0.0 else None,
+        atr14[i],
+        ema20[i],
+        ema50[i],
+        ema_diff[i],
+        ema_slope[i],
+        trend_dir[i],
+    )
+
+    conn.execute(
+        """INSERT OR REPLACE INTO agg_trend
+           (instId,interval,candle_ts,close,atr14,ema20,ema50,ema_diff,ema_slope,trend_dir)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
         row,
     )
     return 1

@@ -14,7 +14,12 @@ from .storage import SQLiteStore
 from .ws_client import WSShard
 from .rest_client import RestPoller
 from .aggregator import MicroAggregator
-from .trend_15m import rebuild_15m_trend, update_last_15m_trend
+from .trend_15m import (
+    rebuild_15m_trend,
+    rebuild_trend_interval,
+    update_last_15m_trend,
+    update_last_trend_interval,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,15 +37,17 @@ def shard_symbols(symbols: List[str], channels_per_symbol: List[str], max_channe
     return shards
 
 
-async def warmup_candles_15m(
+async def warmup_candles(
     store: SQLiteStore,
     inst_type: str,
     product_type: str,
     symbols: List[str],
+    interval: str,
+    granularity: str,
     limit: int = 200,
 ) -> None:
     """
-    Прогрев: тянем последние N свечей 15m через REST и кладём их в raw_ws_candle с interval='candle15m'.
+    Прогрев: тянем последние N свечей через REST и кладём их в raw_ws_candle.
     Это даёт ATR сразу после старта (не ждём 3-4 часа).
     """
     url = "https://api.bitget.com/api/v2/mix/market/candles"
@@ -52,7 +59,7 @@ async def warmup_candles_15m(
             params = {
                 "symbol": sym,
                 "productType": product_type,
-                "granularity": "15m",
+                "granularity": granularity,
                 "limit": limit,
             }
             try:
@@ -76,15 +83,15 @@ async def warmup_candles_15m(
                     candle_ts = int(item[0])
                     o, h, l, c, v = map(str, item[1:6])
                     rows.append(
-                        (inst_type, sym, "candle15m", candle_ts, recv_ts, o, h, l, c, v, json.dumps(item, separators=(",", ":")))
+                        (inst_type, sym, interval, candle_ts, recv_ts, o, h, l, c, v, json.dumps(item, separators=(",", ":")))
                     )
 
             if rows:
                 store.put_raw_ws_candle(rows)
                 rows_total += len(rows)
-                log.info("Warmup %s: inserted %d 15m candles", sym, len(rows))
+                log.info("Warmup %s %s: inserted %d candles", sym, interval, len(rows))
 
-    log.info("Warmup done: inserted total %d 15m candles", rows_total)
+    log.info("Warmup done %s: inserted total %d candles", interval, rows_total)
 
 
 async def main_async(cfg: Dict[str, Any]) -> None:
@@ -100,23 +107,56 @@ async def main_async(cfg: Dict[str, Any]) -> None:
 
     agg = MicroAggregator()
 
-    # ---- WARMUP (15m candles) ----
-    warmup_limit = int(cfg.get("warmup", {}).get("candles_15m_limit", 200))
+    # ---- WARMUP (candles) ----
+    warmup_cfg = cfg.get("warmup", {})
+    warmup_limit_15m = int(warmup_cfg.get("candles_15m_limit", 200))
+    warmup_limit_1h = int(warmup_cfg.get("candles_1h_limit", 200))
+    warmup_limit_4h = int(warmup_cfg.get("candles_4h_limit", 200))
     try:
-        await warmup_candles_15m(
+        await warmup_candles(
             store=store,
             inst_type=inst_type,
             product_type=cfg["rest_product_type"],
             symbols=symbols,
-            limit=warmup_limit,
+            interval="candle15m",
+            granularity="15m",
+            limit=warmup_limit_15m,
+        )
+        await warmup_candles(
+            store=store,
+            inst_type=inst_type,
+            product_type=cfg["rest_product_type"],
+            symbols=symbols,
+            interval="candle1h",
+            granularity="1H",
+            limit=warmup_limit_1h,
+        )
+        await warmup_candles(
+            store=store,
+            inst_type=inst_type,
+            product_type=cfg["rest_product_type"],
+            symbols=symbols,
+            interval="candle4h",
+            granularity="4H",
+            limit=warmup_limit_4h,
         )
         # Build 15m trend/regime layer once (so strategy/backtest doesn't compute on the fly)
         for sym in symbols:
             try:
-                n = rebuild_15m_trend(store.conn, sym, lookback=max(600, warmup_limit + 50))
+                n = rebuild_15m_trend(store.conn, sym, lookback=max(600, warmup_limit_15m + 50))
                 log.info("Warmup %s: built agg_15m_trend rows=%d", sym, n)
             except Exception as e:
                 log.warning("Warmup trend build failed %s: %s", sym, e)
+            try:
+                n = rebuild_trend_interval(store.conn, sym, "candle1h", lookback=max(600, warmup_limit_1h + 50))
+                log.info("Warmup %s: built agg_trend candle1h rows=%d", sym, n)
+            except Exception as e:
+                log.warning("Warmup trend build 1h failed %s: %s", sym, e)
+            try:
+                n = rebuild_trend_interval(store.conn, sym, "candle4h", lookback=max(600, warmup_limit_4h + 50))
+                log.info("Warmup %s: built agg_trend candle4h rows=%d", sym, n)
+            except Exception as e:
+                log.warning("Warmup trend build 4h failed %s: %s", sym, e)
     except Exception as e:
         log.warning("Warmup failed (continuing anyway): %s", e)
 
@@ -185,13 +225,19 @@ async def main_async(cfg: Dict[str, Any]) -> None:
                         candle_ts = int(item[0])
                         o, h, l, c, v = map(str, item[1:6])
                         row = (inst_type, instId, channel, candle_ts, recv_ts, o, h, l, c, v, json.dumps(item, separators=(",", ":")))
-                        # For candle15m: write immediately and update agg_15m_trend (rare event, safe to do sync)
+                        # For higher TF candles: write immediately and update trend (rare event, safe to do sync)
                         if channel == "candle15m":
                             store.put_raw_ws_candle([row])
                             try:
                                 update_last_15m_trend(store.conn, instId, lookback=300)
                             except Exception as e:
                                 log.warning("15m trend update failed %s: %s", instId, e)
+                        elif channel in ("candle1h", "candle4h"):
+                            store.put_raw_ws_candle([row])
+                            try:
+                                update_last_trend_interval(store.conn, instId, channel, lookback=300)
+                            except Exception as e:
+                                log.warning("%s trend update failed %s: %s", channel, instId, e)
                         else:
                             buf_candle.append(row)
                     elif isinstance(item, dict):
@@ -208,6 +254,12 @@ async def main_async(cfg: Dict[str, Any]) -> None:
                                 update_last_15m_trend(store.conn, instId, lookback=300)
                             except Exception as e:
                                 log.warning("15m trend update failed %s: %s", instId, e)
+                        elif channel in ("candle1h", "candle4h"):
+                            store.put_raw_ws_candle([row])
+                            try:
+                                update_last_trend_interval(store.conn, instId, channel, lookback=300)
+                            except Exception as e:
+                                log.warning("%s trend update failed %s: %s", channel, instId, e)
                         else:
                             buf_candle.append(row)
 
