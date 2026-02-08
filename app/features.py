@@ -25,9 +25,13 @@ class FeatureRow:
     delta_rate_z: Optional[float]
     imbalance15: Optional[float]
     imb_shift: Optional[float]
+    imbalance5: Optional[float]
+    depth_ratio5: Optional[float]
 
     # higher TF
     atr15m: Optional[float]
+    atr1h: Optional[float]
+    atr4h: Optional[float]
 
     # context
     mark_last: Optional[float]
@@ -51,6 +55,14 @@ class FeatureRow:
     ema_slope_15m: Optional[float]         # slope of fast EMA (pct per candle)
     trend_dir_15m: Optional[int]           # +1 up, -1 down, 0 unknown/flat
 
+    # NEW: higher TF trend
+    ema_diff_1h: Optional[float]
+    ema_slope_1h: Optional[float]
+    trend_dir_1h: Optional[int]
+    ema_diff_4h: Optional[float]
+    ema_slope_4h: Optional[float]
+    trend_dir_4h: Optional[int]
+
     # NEW: entry context (for better long filtering)
     ret_1m_before: Optional[float]
     ret_5m_before: Optional[float]
@@ -61,6 +73,9 @@ class FeatureRow:
     dz_mean_15s_before: Optional[float]
     imb_mean_5s_before: Optional[float]
     imb_mean_15s_before: Optional[float]
+
+    # liquidity / regime
+    trade_count_15m: Optional[int]
 
 
 def _safe_float(x: Any) -> Optional[float]:
@@ -103,20 +118,39 @@ class FeatureService:
         deltas = [_safe_float(r["delta_vol"]) for r in micro if r["delta_vol"] is not None]
         delta_vol = deltas[-1] if deltas else None
 
-        # Prefer stored delta_rate_z if present in agg_1s_micro (faster + consistent)
-        delta_rate_z = _safe_float(last.get("delta_rate_z")) if isinstance(last, dict) else None
-        if delta_rate_z is None:
-            # compute z on the fly (fallback)
-            if delta_vol is not None and len(deltas) >= 20:
-                mu = sum(deltas) / len(deltas)
-                var = sum((x - mu) ** 2 for x in deltas) / (len(deltas) - 1)
-                std = math.sqrt(var) if var > 0 else None
-                if std and std > 0:
-                    delta_rate_z = (delta_vol - mu) / std
+        # Robust z-score (median/MAD) for stability
+        delta_rate_z = None
+        if delta_vol is not None and len(deltas) >= 30:
+            sorted_d = sorted(deltas)
+            mid = len(sorted_d) // 2
+            if len(sorted_d) % 2 == 1:
+                med = sorted_d[mid]
+            else:
+                med = (sorted_d[mid - 1] + sorted_d[mid]) / 2.0
+            abs_dev = [abs(x - med) for x in sorted_d]
+            abs_dev.sort()
+            mid_ad = len(abs_dev) // 2
+            if len(abs_dev) % 2 == 1:
+                mad = abs_dev[mid_ad]
+            else:
+                mad = (abs_dev[mid_ad - 1] + abs_dev[mid_ad]) / 2.0
+            if mad and mad > 0:
+                delta_rate_z = (delta_vol - med) / (1.4826 * mad)
+
+        # fallback to classic z if MAD unavailable
+        if delta_rate_z is None and delta_vol is not None and len(deltas) >= 20:
+            mu = sum(deltas) / len(deltas)
+            var = sum((x - mu) ** 2 for x in deltas) / (len(deltas) - 1)
+            std = math.sqrt(var) if var > 0 else None
+            if std and std > 0:
+                delta_rate_z = (delta_vol - mu) / std
 
         # imbalance shift
         imbs = [_safe_float(r["imbalance15"]) for r in micro if r["imbalance15"] is not None]
         imbalance15 = imbs[-1] if imbs else None
+
+        imbalance5 = _safe_float(last["imbalance5"]) if "imbalance5" in last.keys() else None
+        depth_ratio5 = _safe_float(last["depth_ratio5"]) if "depth_ratio5" in last.keys() else None
 
         imb_shift = None
         # Prefer stored imb_shift column if exists in agg_1s_micro
@@ -127,6 +161,9 @@ class FeatureService:
 
         # 15m trend/regime (materialized in DB by app/trend_15m.py)
         atr15m, ema_fast_15m, ema_slow_15m, ema_diff_15m, ema_slope_15m, trend_dir_15m = self._fetch_15m_trend_row(instId, sec_ts)
+        # higher TF
+        atr1h, ema_diff_1h, ema_slope_1h, trend_dir_1h = self._fetch_trend_row(instId, sec_ts, "candle1h")
+        atr4h, ema_diff_4h, ema_slope_4h, trend_dir_4h = self._fetch_trend_row(instId, sec_ts, "candle4h")
 
         # Context
         ctx = self._fetch_context(instId, sec_ts)
@@ -197,6 +234,9 @@ class FeatureService:
         dz_mean_5s_before, dz_mean_15s_before = self._fetch_micro_mean_before(instId, sec_ts, ["delta_rate_z", "delta_vol"])
         imb_mean_5s_before, imb_mean_15s_before = self._fetch_micro_mean_before(instId, sec_ts, ["imb_shift", "imbalance15"])
 
+        # liquidity regime (15m)
+        trade_count_15m = self._fetch_trade_count_15m(instId, sec_ts)
+
         return FeatureRow(
             instId=instId,
             ts=sec_ts,
@@ -213,8 +253,12 @@ class FeatureService:
             delta_rate_z=delta_rate_z,
             imbalance15=imbalance15,
             imb_shift=imb_shift,
+            imbalance5=imbalance5,
+            depth_ratio5=depth_ratio5,
 
             atr15m=atr15m,
+            atr1h=atr1h,
+            atr4h=atr4h,
 
             mark_last=mark_last,
             index_last=index_last,
@@ -235,6 +279,13 @@ class FeatureService:
             ema_slope_15m=ema_slope_15m,
             trend_dir_15m=trend_dir_15m,
 
+            ema_diff_1h=ema_diff_1h,
+            ema_slope_1h=ema_slope_1h,
+            trend_dir_1h=trend_dir_1h,
+            ema_diff_4h=ema_diff_4h,
+            ema_slope_4h=ema_slope_4h,
+            trend_dir_4h=trend_dir_4h,
+
             ret_1m_before=ret_1m_before,
             ret_5m_before=ret_5m_before,
             ret_15m_before=ret_15m_before,
@@ -244,6 +295,8 @@ class FeatureService:
             dz_mean_15s_before=dz_mean_15s_before,
             imb_mean_5s_before=imb_mean_5s_before,
             imb_mean_15s_before=imb_mean_15s_before,
+
+            trade_count_15m=trade_count_15m,
         )
 
     # -------------------------
@@ -376,6 +429,33 @@ class FeatureService:
             int(r[5]) if r[5] is not None else None,
         )
 
+    def _fetch_trend_row(
+        self, instId: str, sec_ts: int, interval: str
+    ) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[int]]:
+        try:
+            r = self.conn.execute(
+                """
+                SELECT atr14, ema_diff, ema_slope, trend_dir
+                FROM agg_trend
+                WHERE instId=? AND interval=? AND candle_ts<=?
+                ORDER BY candle_ts DESC
+                LIMIT 1
+                """,
+                (instId, interval, sec_ts),
+            ).fetchone()
+        except Exception:
+            r = None
+
+        if not r:
+            return None, None, None, None
+
+        return (
+            _safe_float(r[0]),
+            _safe_float(r[1]),
+            _safe_float(r[2]),
+            int(r[3]) if r[3] is not None else None,
+        )
+
     def _fetch_context(self, instId: str, sec_ts: int) -> dict:
         min_ts = sec_ts - (sec_ts % 60000)
 
@@ -433,3 +513,19 @@ class FeatureService:
             "funding": funding,
             "mark_dev_z": mark_dev_z,
         }
+
+    def _fetch_trade_count_15m(self, instId: str, sec_ts: int) -> Optional[int]:
+        r = self.conn.execute(
+            """
+            SELECT SUM(trade_count)
+            FROM agg_1s_micro
+            WHERE instId=? AND sec_ts>? AND sec_ts<=?
+            """,
+            (instId, sec_ts - 15 * 60_000, sec_ts),
+        ).fetchone()
+        if not r or r[0] is None:
+            return None
+        try:
+            return int(r[0])
+        except Exception:
+            return None
