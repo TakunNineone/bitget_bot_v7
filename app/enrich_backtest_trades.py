@@ -81,6 +81,41 @@ def fetch_mid_window(conn: sqlite3.Connection, instId: str, ts_from_ms: int, ts_
     return out
 
 
+def fetch_15m_trend_at(conn: sqlite3.Connection, instId: str, ts_ms: int) -> Dict[str, Any]:
+    """Fetch latest agg_15m_trend row with candle_ts<=ts_ms."""
+    r = conn.execute(
+        """
+        SELECT candle_ts, close, atr14, ema20, ema50, ema_diff, ema_slope, trend_dir
+        FROM agg_15m_trend
+        WHERE instId=? AND candle_ts<=?
+        ORDER BY candle_ts DESC
+        LIMIT 1
+        """,
+        (instId, ts_ms),
+    ).fetchone()
+    if not r:
+        return {
+            "candle_ts": None,
+            "close": None,
+            "atr14": None,
+            "ema20": None,
+            "ema50": None,
+            "ema_diff": None,
+            "ema_slope": None,
+            "trend_dir": None,
+        }
+    return {
+        "candle_ts": safe_int(r[0]),
+        "close": safe_float(r[1]),
+        "atr14": safe_float(r[2]),
+        "ema20": safe_float(r[3]),
+        "ema50": safe_float(r[4]),
+        "ema_diff": safe_float(r[5]),
+        "ema_slope": safe_float(r[6]),
+        "trend_dir": safe_int(r[7]),
+    }
+
+
 def pct_change(a: Optional[float], b: Optional[float]) -> Optional[float]:
     # (a - b) / b
     if a is None or b is None:
@@ -199,6 +234,7 @@ def ensure_enrich_columns(conn: sqlite3.Connection, table: str) -> None:
         ("imb_mean_5s_before", "REAL"),
         ("imb_mean_15s_before", "REAL"),
         ("flow_accel_30s", "REAL"),
+        ("x_flow_accel_30s", "REAL"),
     ]:
         add_col(conn, table, col, typ)
 
@@ -509,6 +545,7 @@ def enrich(
 
             # Flow accel
             flow_accel_30s = compute_flow_accel_30s(fs, instId, entry_ts)
+            x_flow_accel_30s = compute_flow_accel_30s(fs, instId, exit_ts)
 
             # Holding stats
             duration_sec = int((exit_ts - entry_ts) / 1000)
@@ -536,7 +573,7 @@ def enrich(
                   dist_from_15m_high=?, dist_from_15m_low=?,
                   dz_mean_5s_before=?, dz_mean_15s_before=?,
                   imb_mean_5s_before=?, imb_mean_15s_before=?,
-                  flow_accel_30s=?,
+                  flow_accel_30s=?, x_flow_accel_30s=?,
                   duration_sec=?, bars_1m_held=?, bars_5s_held=?,
 
                   enriched_at=?
@@ -560,7 +597,7 @@ def enrich(
                     d_hi, d_lo,
                     dz_mean_5s, dz_mean_15s,
                     imb_mean_5s, imb_mean_15s,
-                    flow_accel_30s,
+                    flow_accel_30s, x_flow_accel_30s,
                     duration_sec, bars_1m, bars_5s,
                     int(time.time()),
                     trade_id,
