@@ -27,6 +27,29 @@ def pct_change(a: Optional[float], b: Optional[float]) -> Optional[float]:
     return (a - b) / b
 
 
+def _median(xs: List[float]) -> Optional[float]:
+    if not xs:
+        return None
+    ys = sorted(xs)
+    mid = len(ys) // 2
+    if len(ys) % 2 == 1:
+        return ys[mid]
+    return (ys[mid - 1] + ys[mid]) / 2.0
+
+
+def robust_zscore(series: List[float], value: float) -> Optional[float]:
+    if len(series) < 30:
+        return None
+    med = _median(series)
+    if med is None:
+        return None
+    abs_dev = [abs(x - med) for x in series]
+    mad = _median(abs_dev)
+    if mad is None or mad <= 0:
+        return None
+    return (value - med) / (1.4826 * mad)
+
+
 # ============================================================
 # FeatureRowLite: stable duck-typed object for decide()
 # (does NOT depend on features.FeatureRow constructor)
@@ -53,6 +76,8 @@ class FeatureRowLite:
 
     imbalance15: Optional[float] = None
     imb_shift: Optional[float] = None
+    imbalance5: Optional[float] = None
+    depth_ratio5: Optional[float] = None
 
     # fast-react / flow
     range_60s_pct: Optional[float] = None
@@ -67,6 +92,16 @@ class FeatureRowLite:
     ema_diff_15m: Optional[float] = None
     ema_slope_15m: Optional[float] = None
     trend_dir_15m: Optional[int] = None
+
+    # higher TF trend
+    atr1h: Optional[float] = None
+    atr4h: Optional[float] = None
+    ema_diff_1h: Optional[float] = None
+    ema_slope_1h: Optional[float] = None
+    trend_dir_1h: Optional[int] = None
+    ema_diff_4h: Optional[float] = None
+    ema_slope_4h: Optional[float] = None
+    trend_dir_4h: Optional[int] = None
 
     # 1m context
     mark_last: Optional[float] = None
@@ -87,6 +122,7 @@ class FeatureRowLite:
     imb_mean_5s_before: Optional[float] = None
     imb_mean_15s_before: Optional[float] = None
     flow_accel_30s: Optional[float] = None
+    trade_count_15m: Optional[int] = None
 
 
 # =========================
@@ -156,9 +192,17 @@ class RollingIntWindow:
 # DB loads
 # =========================
 
+def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(r[1] == column for r in rows)
+
+
 def load_1s_micro(conn: sqlite3.Connection, instId: str, start_ms: Optional[int], end_ms: Optional[int]) -> List[sqlite3.Row]:
-    q = """
-        SELECT sec_ts, mid, vwap, spread_bps, ret_1s, trade_count, delta_vol, imbalance15
+    imbalance5_col = "imbalance5" if _column_exists(conn, "agg_1s_micro", "imbalance5") else "NULL AS imbalance5"
+    depth_ratio5_col = "depth_ratio5" if _column_exists(conn, "agg_1s_micro", "depth_ratio5") else "NULL AS depth_ratio5"
+    q = f"""
+        SELECT sec_ts, mid, vwap, spread_bps, ret_1s, trade_count, delta_vol, imbalance15,
+               {imbalance5_col}, {depth_ratio5_col}
         FROM agg_1s_micro
         WHERE instId=?
     """
@@ -204,6 +248,16 @@ def load_15m_trend(conn: sqlite3.Connection, instId: str) -> List[sqlite3.Row]:
         ORDER BY candle_ts ASC
     """
     return conn.execute(q, (instId,)).fetchall()
+
+
+def load_trend_interval(conn: sqlite3.Connection, instId: str, interval: str) -> List[sqlite3.Row]:
+    q = """
+        SELECT candle_ts, atr14, ema20, ema50, ema_diff, ema_slope, trend_dir
+        FROM agg_trend
+        WHERE instId=? AND interval=?
+        ORDER BY candle_ts ASC
+    """
+    return conn.execute(q, (instId, interval)).fetchall()
 
 
 def load_1m_context(conn: sqlite3.Connection, instId: str) -> List[sqlite3.Row]:
@@ -512,17 +566,37 @@ def backtest_fast(
             print(f"{sym}: no 15m regime rows (agg_15m_trend empty and ATR compute failed)")
             continue
 
+        # ---- higher TF regime source (1h/4h) ----
+        use_trend_table = _table_exists(conn, "agg_trend")
+        trend_1h_rows: List[sqlite3.Row] = load_trend_interval(conn, sym, "candle1h") if use_trend_table else []
+        trend_4h_rows: List[sqlite3.Row] = load_trend_interval(conn, sym, "candle4h") if use_trend_table else []
+
+        trend_1h_ts = [int(r["candle_ts"]) for r in trend_1h_rows] if trend_1h_rows else []
+        atr_1h = [float(r["atr14"]) if r["atr14"] is not None else None for r in trend_1h_rows] if trend_1h_rows else []
+        ema_diff_1h_s = [float(r["ema_diff"]) if r["ema_diff"] is not None else None for r in trend_1h_rows] if trend_1h_rows else []
+        ema_slope_1h_s = [float(r["ema_slope"]) if r["ema_slope"] is not None else None for r in trend_1h_rows] if trend_1h_rows else []
+        trend_dir_1h_s = [int(r["trend_dir"]) if r["trend_dir"] is not None else None for r in trend_1h_rows] if trend_1h_rows else []
+
+        trend_4h_ts = [int(r["candle_ts"]) for r in trend_4h_rows] if trend_4h_rows else []
+        atr_4h = [float(r["atr14"]) if r["atr14"] is not None else None for r in trend_4h_rows] if trend_4h_rows else []
+        ema_diff_4h_s = [float(r["ema_diff"]) if r["ema_diff"] is not None else None for r in trend_4h_rows] if trend_4h_rows else []
+        ema_slope_4h_s = [float(r["ema_slope"]) if r["ema_slope"] is not None else None for r in trend_4h_rows] if trend_4h_rows else []
+        trend_dir_4h_s = [int(r["trend_dir"]) if r["trend_dir"] is not None else None for r in trend_4h_rows] if trend_4h_rows else []
+
         ctx_rows = load_1m_context(conn, sym)
         ctx_min_ts = [int(r["min_ts"]) for r in ctx_rows] if ctx_rows else []
         ctx_mark_z_ts, ctx_mark_z = compute_mark_dev_z(ctx_rows) if ctx_rows else ([], [])
 
         ptr_atr = 0
         ptr_ctx = 0
+        ptr_1h = 0
+        ptr_4h = 0
 
         # rolling windows
         last60_mid: List[float] = []
         w_flow60 = RollingIntWindow(60)
         w_flow600 = RollingIntWindow(600)
+        w_flow900 = RollingIntWindow(900)
         w_deltas = RollingFloatWindow(600)
         last5_tc: List[int] = []
 
@@ -551,6 +625,22 @@ def backtest_fast(
             ema_diff_15m = ema_diff_s[ptr_atr] if ema_diff_s else None
             ema_slope_15m = ema_slope_s[ptr_atr] if ema_slope_s else None
             trend_dir_15m = trend_dir_s[ptr_atr] if trend_dir_s else None
+
+            # ---- attach 1h/4h regime ----
+            while ptr_1h + 1 < len(trend_1h_ts) and trend_1h_ts[ptr_1h + 1] <= sec_ts:
+                ptr_1h += 1
+            while ptr_4h + 1 < len(trend_4h_ts) and trend_4h_ts[ptr_4h + 1] <= sec_ts:
+                ptr_4h += 1
+
+            atr1h = atr_1h[ptr_1h] if atr_1h else None
+            ema_diff_1h = ema_diff_1h_s[ptr_1h] if ema_diff_1h_s else None
+            ema_slope_1h = ema_slope_1h_s[ptr_1h] if ema_slope_1h_s else None
+            trend_dir_1h = trend_dir_1h_s[ptr_1h] if trend_dir_1h_s else None
+
+            atr4h = atr_4h[ptr_4h] if atr_4h else None
+            ema_diff_4h = ema_diff_4h_s[ptr_4h] if ema_diff_4h_s else None
+            ema_slope_4h = ema_slope_4h_s[ptr_4h] if ema_slope_4h_s else None
+            trend_dir_4h = trend_dir_4h_s[ptr_4h] if trend_dir_4h_s else None
 
             # ---- attach 1m context ----
             min_ts = sec_ts - (sec_ts % 60000)
@@ -592,6 +682,8 @@ def backtest_fast(
             trade_count = int(r["trade_count"] or 0)
             delta_vol = float(r["delta_vol"]) if r["delta_vol"] is not None else None
             imbalance15 = float(r["imbalance15"]) if r["imbalance15"] is not None else None
+            imbalance5 = float(r["imbalance5"]) if r["imbalance5"] is not None else None
+            depth_ratio5 = float(r["depth_ratio5"]) if r["depth_ratio5"] is not None else None
 
             # 5s stats
             last5_tc.append(trade_count)
@@ -605,13 +697,15 @@ def backtest_fast(
                 w_deltas.push(delta_vol)
 
             delta_rate_z = None
-            if delta_vol is not None and w_deltas.count() >= 20:
-                mu = sum(w_deltas.vals) / len(w_deltas.vals)
-                var = sum((x - mu) ** 2 for x in w_deltas.vals) / (len(w_deltas.vals) - 1)
-                if var > 0:
-                    std = math.sqrt(var)
-                    if std > 0:
-                        delta_rate_z = (delta_vol - mu) / std
+            if delta_vol is not None:
+                delta_rate_z = robust_zscore(w_deltas.vals, delta_vol)
+                if delta_rate_z is None and w_deltas.count() >= 20:
+                    mu = sum(w_deltas.vals) / len(w_deltas.vals)
+                    var = sum((x - mu) ** 2 for x in w_deltas.vals) / (len(w_deltas.vals) - 1)
+                    if var > 0:
+                        std = math.sqrt(var)
+                        if std > 0:
+                            delta_rate_z = (delta_vol - mu) / std
 
             # imbalance shift
             imb_shift = None
@@ -665,7 +759,9 @@ def backtest_fast(
             # flow windows
             w_flow60.push(trade_count)
             w_flow600.push(trade_count)
+            w_flow900.push(trade_count)
             flow_60s = w_flow60.s
+            trade_count_15m = w_flow900.s
 
             # 60s mid range
             if mid is not None:
@@ -727,6 +823,8 @@ def backtest_fast(
 
                 imbalance15=imbalance15,
                 imb_shift=imb_shift,
+                imbalance5=imbalance5,
+                depth_ratio5=depth_ratio5,
 
                 range_60s_pct=range_60s_pct,
                 ret_std_60s=ret_std_60s,
@@ -739,6 +837,15 @@ def backtest_fast(
                 ema_diff_15m=ema_diff_15m,
                 ema_slope_15m=ema_slope_15m,
                 trend_dir_15m=trend_dir_15m,
+
+                atr1h=atr1h,
+                atr4h=atr4h,
+                ema_diff_1h=ema_diff_1h,
+                ema_slope_1h=ema_slope_1h,
+                trend_dir_1h=trend_dir_1h,
+                ema_diff_4h=ema_diff_4h,
+                ema_slope_4h=ema_slope_4h,
+                trend_dir_4h=trend_dir_4h,
 
                 mark_last=mark_last,
                 index_last=index_last,
@@ -758,6 +865,7 @@ def backtest_fast(
                 imb_mean_5s_before=imb_mean_5s_before,
                 imb_mean_15s_before=imb_mean_15s_before,
                 flow_accel_30s=flow_accel_30s,
+                trade_count_15m=trade_count_15m,
             )
 
             px = f.mid if f.mid is not None else f.vwap

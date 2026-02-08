@@ -157,8 +157,16 @@ class MicroAggregator:
             spr = spread(best_bid, best_ask)
             mp = microprice(best_bid, best_ask)
             imb = imbalance(book.bids, book.asks) if book else None
+            imb5 = imbalance(book.bids[:5], book.asks[:5]) if book else None
             top_bid_qty = float(best_bid[1]) if best_bid else None
             top_ask_qty = float(best_ask[1]) if best_ask else None
+            top5_bid_qty = sum(float(x[1]) for x in book.bids[:5]) if book else None
+            top5_ask_qty = sum(float(x[1]) for x in book.asks[:5]) if book else None
+            depth_ratio5 = None
+            if top5_bid_qty is not None and top5_ask_qty is not None:
+                denom = top5_bid_qty + top5_ask_qty
+                if denom > 0:
+                    depth_ratio5 = (top5_bid_qty - top5_ask_qty) / denom
 
             tb = self.trades_1s.pop((instId, sec_ts), None)
             trade_count = tb.count if tb else 0
@@ -182,9 +190,9 @@ class MicroAggregator:
 
             rows.append((
                 instId, sec_ts,
-                mid, spr, spread_bps, mp, imb,
-                top_bid_qty, top_ask_qty,
-                trade_count, buy_vol, sell_vol, delta, vwap, ret_1s
+                mid, spr, spread_bps, mp, imb, imb5,
+                top_bid_qty, top_ask_qty, top5_bid_qty, top5_ask_qty, depth_ratio5,
+                trade_count, buy_vol, sell_vol, delta, vwap, ret_1s,
             ))
         return rows
 
