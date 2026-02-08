@@ -94,10 +94,20 @@ def pct_change(a: Optional[float], b: Optional[float]) -> Optional[float]:
 def ensure_enrich_columns(conn: sqlite3.Connection, table: str) -> None:
     # entry snapshot
     for col, typ in [
+        ("e_mid", "REAL"),
+        ("e_vwap", "REAL"),
+        ("e_ret_1s", "REAL"),
+        ("e_trade_count", "INTEGER"),
         ("e_atr_pct", "REAL"),
+        ("e_atr1h", "REAL"),
+        ("e_atr4h", "REAL"),
         ("e_dz", "REAL"),
         ("e_imb", "REAL"),
+        ("e_imbalance15", "REAL"),
+        ("e_imb5", "REAL"),
+        ("e_depth_ratio5", "REAL"),
         ("e_flow60", "INTEGER"),
+        ("e_trade_count_15m", "INTEGER"),
         ("e_spike", "REAL"),
         ("e_range60", "REAL"),
         ("e_std60", "REAL"),
@@ -111,15 +121,31 @@ def ensure_enrich_columns(conn: sqlite3.Connection, table: str) -> None:
         ("e_ema_diff_15m", "REAL"),
         ("e_ema_slope_15m", "REAL"),
         ("e_trend_dir_15m", "INTEGER"),
+        ("e_ema_diff_1h", "REAL"),
+        ("e_ema_slope_1h", "REAL"),
+        ("e_trend_dir_1h", "INTEGER"),
+        ("e_ema_diff_4h", "REAL"),
+        ("e_ema_slope_4h", "REAL"),
+        ("e_trend_dir_4h", "INTEGER"),
     ]:
         add_col(conn, table, col, typ)
 
     # exit snapshot
     for col, typ in [
+        ("x_mid", "REAL"),
+        ("x_vwap", "REAL"),
+        ("x_ret_1s", "REAL"),
+        ("x_trade_count", "INTEGER"),
         ("x_atr_pct", "REAL"),
+        ("x_atr1h", "REAL"),
+        ("x_atr4h", "REAL"),
         ("x_dz", "REAL"),
         ("x_imb", "REAL"),
+        ("x_imbalance15", "REAL"),
+        ("x_imb5", "REAL"),
+        ("x_depth_ratio5", "REAL"),
         ("x_flow60", "INTEGER"),
+        ("x_trade_count_15m", "INTEGER"),
         ("x_spike", "REAL"),
         ("x_range60", "REAL"),
         ("x_std60", "REAL"),
@@ -133,6 +159,12 @@ def ensure_enrich_columns(conn: sqlite3.Connection, table: str) -> None:
         ("x_ema_diff_15m", "REAL"),
         ("x_ema_slope_15m", "REAL"),
         ("x_trend_dir_15m", "INTEGER"),
+        ("x_ema_diff_1h", "REAL"),
+        ("x_ema_slope_1h", "REAL"),
+        ("x_trend_dir_1h", "INTEGER"),
+        ("x_ema_diff_4h", "REAL"),
+        ("x_ema_slope_4h", "REAL"),
+        ("x_trend_dir_4h", "INTEGER"),
     ]:
         add_col(conn, table, col, typ)
 
@@ -195,10 +227,20 @@ def snapshot_from_feature(f) -> Dict[str, Any]:
             atr_pct = None
 
     return {
+        "mid": safe_float(getattr(f, "mid", None)),
+        "vwap": safe_float(getattr(f, "vwap", None)),
+        "ret_1s": safe_float(getattr(f, "ret_1s", None)),
+        "trade_count": safe_int(getattr(f, "trade_count", None)),
         "atr_pct": safe_float(atr_pct),
+        "atr1h": safe_float(getattr(f, "atr1h", None)),
+        "atr4h": safe_float(getattr(f, "atr4h", None)),
         "dz": safe_float(getattr(f, "delta_rate_z", None)),
         "imb": safe_float(getattr(f, "imb_shift", None)),
+        "imbalance15": safe_float(getattr(f, "imbalance15", None)),
+        "imb5": safe_float(getattr(f, "imbalance5", None)),
+        "depth_ratio5": safe_float(getattr(f, "depth_ratio5", None)),
         "flow60": int(getattr(f, "flow_60s", 0) or 0),
+        "trade_count_15m": safe_int(getattr(f, "trade_count_15m", None)),
         "spike": safe_float(getattr(f, "flow_spike", None)),
         "range60": safe_float(getattr(f, "range_60s_pct", None)),
         "std60": safe_float(getattr(f, "ret_std_60s", None)),
@@ -212,6 +254,12 @@ def snapshot_from_feature(f) -> Dict[str, Any]:
         "ema_diff_15m": safe_float(getattr(f, "ema_diff_15m", None)),
         "ema_slope_15m": safe_float(getattr(f, "ema_slope_15m", None)),
         "trend_dir_15m": getattr(f, "trend_dir_15m", None),
+        "ema_diff_1h": safe_float(getattr(f, "ema_diff_1h", None)),
+        "ema_slope_1h": safe_float(getattr(f, "ema_slope_1h", None)),
+        "trend_dir_1h": getattr(f, "trend_dir_1h", None),
+        "ema_diff_4h": safe_float(getattr(f, "ema_diff_4h", None)),
+        "ema_slope_4h": safe_float(getattr(f, "ema_slope_4h", None)),
+        "trend_dir_4h": getattr(f, "trend_dir_4h", None),
     }
 
 
@@ -471,11 +519,17 @@ def enrich(
                 f"""
                 UPDATE {table}
                 SET
-                  e_atr_pct=?, e_dz=?, e_imb=?, e_flow60=?, e_spike=?, e_range60=?, e_std60=?, e_spread_bps=?, e_mark_z=?, e_oi=?, e_doi=?, e_funding=?,
+                  e_mid=?, e_vwap=?, e_ret_1s=?, e_trade_count=?,
+                  e_atr_pct=?, e_atr1h=?, e_atr4h=?, e_dz=?, e_imb=?, e_imbalance15=?, e_imb5=?, e_depth_ratio5=?, e_flow60=?, e_trade_count_15m=?,
+                  e_spike=?, e_range60=?, e_std60=?, e_spread_bps=?, e_mark_z=?, e_oi=?, e_doi=?, e_funding=?,
                   e_ema_fast_15m=?, e_ema_slow_15m=?, e_ema_diff_15m=?, e_ema_slope_15m=?, e_trend_dir_15m=?,
+                  e_ema_diff_1h=?, e_ema_slope_1h=?, e_trend_dir_1h=?, e_ema_diff_4h=?, e_ema_slope_4h=?, e_trend_dir_4h=?,
 
-                  x_atr_pct=?, x_dz=?, x_imb=?, x_flow60=?, x_spike=?, x_range60=?, x_std60=?, x_spread_bps=?, x_mark_z=?, x_oi=?, x_doi=?, x_funding=?,
+                  x_mid=?, x_vwap=?, x_ret_1s=?, x_trade_count=?,
+                  x_atr_pct=?, x_atr1h=?, x_atr4h=?, x_dz=?, x_imb=?, x_imbalance15=?, x_imb5=?, x_depth_ratio5=?, x_flow60=?, x_trade_count_15m=?,
+                  x_spike=?, x_range60=?, x_std60=?, x_spread_bps=?, x_mark_z=?, x_oi=?, x_doi=?, x_funding=?,
                   x_ema_fast_15m=?, x_ema_slow_15m=?, x_ema_diff_15m=?, x_ema_slope_15m=?, x_trend_dir_15m=?,
+                  x_ema_diff_1h=?, x_ema_slope_1h=?, x_trend_dir_1h=?, x_ema_diff_4h=?, x_ema_slope_4h=?, x_trend_dir_4h=?,
 
                   mfe_pct=?, mae_pct=?, time_to_mfe_s=?, time_to_mae_s=?,
                   ret_1m_before=?, ret_5m_before=?, ret_15m_before=?,
@@ -489,11 +543,17 @@ def enrich(
                 WHERE id=?
                 """,
                 (
-                    e["atr_pct"], e["dz"], e["imb"], e["flow60"], e["spike"], e["range60"], e["std60"], e["spread_bps"], e["mark_z"], e["oi"], e["doi"], e["funding"],
+                    e["mid"], e["vwap"], e["ret_1s"], e["trade_count"],
+                    e["atr_pct"], e["atr1h"], e["atr4h"], e["dz"], e["imb"], e["imbalance15"], e["imb5"], e["depth_ratio5"], e["flow60"], e["trade_count_15m"],
+                    e["spike"], e["range60"], e["std60"], e["spread_bps"], e["mark_z"], e["oi"], e["doi"], e["funding"],
                     e["ema_fast_15m"], e["ema_slow_15m"], e["ema_diff_15m"], e["ema_slope_15m"], e["trend_dir_15m"],
+                    e["ema_diff_1h"], e["ema_slope_1h"], e["trend_dir_1h"], e["ema_diff_4h"], e["ema_slope_4h"], e["trend_dir_4h"],
 
-                    x["atr_pct"], x["dz"], x["imb"], x["flow60"], x["spike"], x["range60"], x["std60"], x["spread_bps"], x["mark_z"], x["oi"], x["doi"], x["funding"],
+                    x["mid"], x["vwap"], x["ret_1s"], x["trade_count"],
+                    x["atr_pct"], x["atr1h"], x["atr4h"], x["dz"], x["imb"], x["imbalance15"], x["imb5"], x["depth_ratio5"], x["flow60"], x["trade_count_15m"],
+                    x["spike"], x["range60"], x["std60"], x["spread_bps"], x["mark_z"], x["oi"], x["doi"], x["funding"],
                     x["ema_fast_15m"], x["ema_slow_15m"], x["ema_diff_15m"], x["ema_slope_15m"], x["trend_dir_15m"],
+                    x["ema_diff_1h"], x["ema_slope_1h"], x["trend_dir_1h"], x["ema_diff_4h"], x["ema_slope_4h"], x["trend_dir_4h"],
 
                     mfe, mae, t_mfe, t_mae,
                     ret_1m, ret_5m, ret_15m,
