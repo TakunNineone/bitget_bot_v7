@@ -81,6 +81,41 @@ def fetch_mid_window(conn: sqlite3.Connection, instId: str, ts_from_ms: int, ts_
     return out
 
 
+def fetch_15m_trend_at(conn: sqlite3.Connection, instId: str, ts_ms: int) -> Dict[str, Any]:
+    """Fetch latest agg_15m_trend row with candle_ts<=ts_ms."""
+    r = conn.execute(
+        """
+        SELECT candle_ts, close, atr14, ema20, ema50, ema_diff, ema_slope, trend_dir
+        FROM agg_15m_trend
+        WHERE instId=? AND candle_ts<=?
+        ORDER BY candle_ts DESC
+        LIMIT 1
+        """,
+        (instId, ts_ms),
+    ).fetchone()
+    if not r:
+        return {
+            "candle_ts": None,
+            "close": None,
+            "atr14": None,
+            "ema20": None,
+            "ema50": None,
+            "ema_diff": None,
+            "ema_slope": None,
+            "trend_dir": None,
+        }
+    return {
+        "candle_ts": safe_int(r[0]),
+        "close": safe_float(r[1]),
+        "atr14": safe_float(r[2]),
+        "ema20": safe_float(r[3]),
+        "ema50": safe_float(r[4]),
+        "ema_diff": safe_float(r[5]),
+        "ema_slope": safe_float(r[6]),
+        "trend_dir": safe_int(r[7]),
+    }
+
+
 def pct_change(a: Optional[float], b: Optional[float]) -> Optional[float]:
     # (a - b) / b
     if a is None or b is None:
@@ -95,14 +130,12 @@ def ensure_enrich_columns(conn: sqlite3.Connection, table: str) -> None:
     # entry snapshot
     for col, typ in [
         ("e_atr_pct", "REAL"),
-        ("e_atr1h", "REAL"),
-        ("e_atr4h", "REAL"),
+        ("e_atr14", "REAL"),
+        ("e_close15m", "REAL"),
+        ("e_candle15m_ts", "INTEGER"),
         ("e_dz", "REAL"),
         ("e_imb", "REAL"),
-        ("e_imb5", "REAL"),
-        ("e_depth_ratio5", "REAL"),
         ("e_flow60", "INTEGER"),
-        ("e_trade_count_15m", "INTEGER"),
         ("e_spike", "REAL"),
         ("e_range60", "REAL"),
         ("e_std60", "REAL"),
@@ -116,26 +149,18 @@ def ensure_enrich_columns(conn: sqlite3.Connection, table: str) -> None:
         ("e_ema_diff_15m", "REAL"),
         ("e_ema_slope_15m", "REAL"),
         ("e_trend_dir_15m", "INTEGER"),
-        ("e_ema_diff_1h", "REAL"),
-        ("e_ema_slope_1h", "REAL"),
-        ("e_trend_dir_1h", "INTEGER"),
-        ("e_ema_diff_4h", "REAL"),
-        ("e_ema_slope_4h", "REAL"),
-        ("e_trend_dir_4h", "INTEGER"),
     ]:
         add_col(conn, table, col, typ)
 
     # exit snapshot
     for col, typ in [
         ("x_atr_pct", "REAL"),
-        ("x_atr1h", "REAL"),
-        ("x_atr4h", "REAL"),
+        ("x_atr14", "REAL"),
+        ("x_close15m", "REAL"),
+        ("x_candle15m_ts", "INTEGER"),
         ("x_dz", "REAL"),
         ("x_imb", "REAL"),
-        ("x_imb5", "REAL"),
-        ("x_depth_ratio5", "REAL"),
         ("x_flow60", "INTEGER"),
-        ("x_trade_count_15m", "INTEGER"),
         ("x_spike", "REAL"),
         ("x_range60", "REAL"),
         ("x_std60", "REAL"),
@@ -149,12 +174,6 @@ def ensure_enrich_columns(conn: sqlite3.Connection, table: str) -> None:
         ("x_ema_diff_15m", "REAL"),
         ("x_ema_slope_15m", "REAL"),
         ("x_trend_dir_15m", "INTEGER"),
-        ("x_ema_diff_1h", "REAL"),
-        ("x_ema_slope_1h", "REAL"),
-        ("x_trend_dir_1h", "INTEGER"),
-        ("x_ema_diff_4h", "REAL"),
-        ("x_ema_slope_4h", "REAL"),
-        ("x_trend_dir_4h", "INTEGER"),
     ]:
         add_col(conn, table, col, typ)
 
@@ -189,6 +208,7 @@ def ensure_enrich_columns(conn: sqlite3.Connection, table: str) -> None:
         ("imb_mean_5s_before", "REAL"),
         ("imb_mean_15s_before", "REAL"),
         ("flow_accel_30s", "REAL"),
+        ("x_flow_accel_30s", "REAL"),
     ]:
         add_col(conn, table, col, typ)
 
@@ -218,14 +238,9 @@ def snapshot_from_feature(f) -> Dict[str, Any]:
 
     return {
         "atr_pct": safe_float(atr_pct),
-        "atr1h": safe_float(getattr(f, "atr1h", None)),
-        "atr4h": safe_float(getattr(f, "atr4h", None)),
         "dz": safe_float(getattr(f, "delta_rate_z", None)),
         "imb": safe_float(getattr(f, "imb_shift", None)),
-        "imb5": safe_float(getattr(f, "imbalance5", None)),
-        "depth_ratio5": safe_float(getattr(f, "depth_ratio5", None)),
         "flow60": int(getattr(f, "flow_60s", 0) or 0),
-        "trade_count_15m": safe_int(getattr(f, "trade_count_15m", None)),
         "spike": safe_float(getattr(f, "flow_spike", None)),
         "range60": safe_float(getattr(f, "range_60s_pct", None)),
         "std60": safe_float(getattr(f, "ret_std_60s", None)),
@@ -239,12 +254,6 @@ def snapshot_from_feature(f) -> Dict[str, Any]:
         "ema_diff_15m": safe_float(getattr(f, "ema_diff_15m", None)),
         "ema_slope_15m": safe_float(getattr(f, "ema_slope_15m", None)),
         "trend_dir_15m": getattr(f, "trend_dir_15m", None),
-        "ema_diff_1h": safe_float(getattr(f, "ema_diff_1h", None)),
-        "ema_slope_1h": safe_float(getattr(f, "ema_slope_1h", None)),
-        "trend_dir_1h": getattr(f, "trend_dir_1h", None),
-        "ema_diff_4h": safe_float(getattr(f, "ema_diff_4h", None)),
-        "ema_slope_4h": safe_float(getattr(f, "ema_slope_4h", None)),
-        "trend_dir_4h": getattr(f, "trend_dir_4h", None),
     }
 
 
@@ -494,6 +503,7 @@ def enrich(
 
             # Flow accel
             flow_accel_30s = compute_flow_accel_30s(fs, instId, entry_ts)
+            x_flow_accel_30s = compute_flow_accel_30s(fs, instId, exit_ts)
 
             # Holding stats
             duration_sec = int((exit_ts - entry_ts) / 1000)
@@ -504,44 +514,36 @@ def enrich(
                 f"""
                 UPDATE {table}
                 SET
-                  e_atr_pct=?, e_atr1h=?, e_atr4h=?, e_dz=?, e_imb=?, e_imb5=?, e_depth_ratio5=?, e_flow60=?, e_trade_count_15m=?,
-                  e_spike=?, e_range60=?, e_std60=?, e_spread_bps=?, e_mark_z=?, e_oi=?, e_doi=?, e_funding=?,
+                  e_atr_pct=?, e_atr14=?, e_close15m=?, e_candle15m_ts=?, e_dz=?, e_imb=?, e_flow60=?, e_spike=?, e_range60=?, e_std60=?, e_spread_bps=?, e_mark_z=?, e_oi=?, e_doi=?, e_funding=?,
                   e_ema_fast_15m=?, e_ema_slow_15m=?, e_ema_diff_15m=?, e_ema_slope_15m=?, e_trend_dir_15m=?,
-                  e_ema_diff_1h=?, e_ema_slope_1h=?, e_trend_dir_1h=?, e_ema_diff_4h=?, e_ema_slope_4h=?, e_trend_dir_4h=?,
 
-                  x_atr_pct=?, x_atr1h=?, x_atr4h=?, x_dz=?, x_imb=?, x_imb5=?, x_depth_ratio5=?, x_flow60=?, x_trade_count_15m=?,
-                  x_spike=?, x_range60=?, x_std60=?, x_spread_bps=?, x_mark_z=?, x_oi=?, x_doi=?, x_funding=?,
+                  x_atr_pct=?, x_atr14=?, x_close15m=?, x_candle15m_ts=?, x_dz=?, x_imb=?, x_flow60=?, x_spike=?, x_range60=?, x_std60=?, x_spread_bps=?, x_mark_z=?, x_oi=?, x_doi=?, x_funding=?,
                   x_ema_fast_15m=?, x_ema_slow_15m=?, x_ema_diff_15m=?, x_ema_slope_15m=?, x_trend_dir_15m=?,
-                  x_ema_diff_1h=?, x_ema_slope_1h=?, x_trend_dir_1h=?, x_ema_diff_4h=?, x_ema_slope_4h=?, x_trend_dir_4h=?,
 
                   mfe_pct=?, mae_pct=?, time_to_mfe_s=?, time_to_mae_s=?,
                   ret_1m_before=?, ret_5m_before=?, ret_15m_before=?,
                   dist_from_15m_high=?, dist_from_15m_low=?,
                   dz_mean_5s_before=?, dz_mean_15s_before=?,
                   imb_mean_5s_before=?, imb_mean_15s_before=?,
-                  flow_accel_30s=?,
+                  flow_accel_30s=?, x_flow_accel_30s=?,
                   duration_sec=?, bars_1m_held=?, bars_5s_held=?,
 
                   enriched_at=?
                 WHERE id=?
                 """,
                 (
-                    e["atr_pct"], e["atr1h"], e["atr4h"], e["dz"], e["imb"], e["imb5"], e["depth_ratio5"], e["flow60"], e["trade_count_15m"],
-                    e["spike"], e["range60"], e["std60"], e["spread_bps"], e["mark_z"], e["oi"], e["doi"], e["funding"],
+                    e["atr_pct"], e["dz"], e["imb"], e["flow60"], e["spike"], e["range60"], e["std60"], e["spread_bps"], e["mark_z"], e["oi"], e["doi"], e["funding"],
                     e["ema_fast_15m"], e["ema_slow_15m"], e["ema_diff_15m"], e["ema_slope_15m"], e["trend_dir_15m"],
-                    e["ema_diff_1h"], e["ema_slope_1h"], e["trend_dir_1h"], e["ema_diff_4h"], e["ema_slope_4h"], e["trend_dir_4h"],
 
-                    x["atr_pct"], x["atr1h"], x["atr4h"], x["dz"], x["imb"], x["imb5"], x["depth_ratio5"], x["flow60"], x["trade_count_15m"],
-                    x["spike"], x["range60"], x["std60"], x["spread_bps"], x["mark_z"], x["oi"], x["doi"], x["funding"],
+                    x["atr_pct"], x["dz"], x["imb"], x["flow60"], x["spike"], x["range60"], x["std60"], x["spread_bps"], x["mark_z"], x["oi"], x["doi"], x["funding"],
                     x["ema_fast_15m"], x["ema_slow_15m"], x["ema_diff_15m"], x["ema_slope_15m"], x["trend_dir_15m"],
-                    x["ema_diff_1h"], x["ema_slope_1h"], x["trend_dir_1h"], x["ema_diff_4h"], x["ema_slope_4h"], x["trend_dir_4h"],
 
                     mfe, mae, t_mfe, t_mae,
                     ret_1m, ret_5m, ret_15m,
                     d_hi, d_lo,
                     dz_mean_5s, dz_mean_15s,
                     imb_mean_5s, imb_mean_15s,
-                    flow_accel_30s,
+                    flow_accel_30s, x_flow_accel_30s,
                     duration_sec, bars_1m, bars_5s,
                     int(time.time()),
                     trade_id,
